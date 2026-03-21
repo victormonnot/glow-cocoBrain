@@ -1,26 +1,20 @@
 """
 eval.py — Évaluation du Global Workspace
 ==========================================
-Deux métriques fondamentales :
-
-1. Cross-modal retrieval : Est-ce que le workspace aligne bien ?
-   Donne une image, cherche le texte le plus proche dans le workspace.
-   Mesure Recall@K.
-
-2. Translation quality : Est-ce que la traduction cross-modale marche ?
-   image → workspace → texte reconstruit. Mesure la qualité.
-
-Si ces métriques sont bonnes, ton workspace a appris une vraie
-représentation partagée. Sinon, c'est du bruit organisé.
+Métriques :
+  1. Cross-modal retrieval (R@1, R@5, R@10)
+  2. Translation MSE (pour vision)
+  3. Traduction qualitative image → texte
+  4. Stats workspace (normes, distances centroïdes)
 """
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from typing import Dict, List, Tuple
-from tqdm import tqdm
+from typing import Dict, List, Optional
 
 from models.workspace import GlobalWorkspace
+from data.tokenizer import SimpleTokenizer
 
 
 @torch.no_grad()
@@ -32,15 +26,7 @@ def compute_retrieval_metrics(
     device: torch.device,
     k_values: List[int] = [1, 5, 10],
 ) -> Dict[str, float]:
-    """Cross-modal retrieval : Recall@K.
-
-    Pour chaque sample, on projette le domaine source dans le workspace,
-    et on cherche le plus proche voisin parmi tous les samples du
-    domaine cible dans le workspace.
-
-    Returns:
-        {"R@1": 0.42, "R@5": 0.78, "R@10": 0.91}
-    """
+    """Cross-modal retrieval : Recall@K."""
     workspace.eval()
 
     all_w_source = []
@@ -56,23 +42,19 @@ def compute_retrieval_metrics(
         all_w_source.append(F.normalize(w_source, dim=-1))
         all_w_target.append(F.normalize(w_target, dim=-1))
 
-    # (N_total, workspace_dim)
     all_w_source = torch.cat(all_w_source, dim=0)
     all_w_target = torch.cat(all_w_target, dim=0)
 
     # Matrice de similarité (N, N)
     sim_matrix = torch.matmul(all_w_source, all_w_target.T)
 
-    # Ground truth : la diagonale (sample i du source → sample i du target)
     N = sim_matrix.size(0)
     gt_indices = torch.arange(N, device=device)
 
-    # Top-K indices
     _, topk_indices = sim_matrix.topk(max(k_values), dim=1)
 
     results = {}
     for k in k_values:
-        # Pour chaque sample, est-ce que le bon match est dans le top-K ?
         correct = (topk_indices[:, :k] == gt_indices.unsqueeze(1)).any(dim=1)
         results[f"R@{k}"] = correct.float().mean().item()
 
@@ -87,11 +69,7 @@ def compute_translation_mse(
     target_domain: str,
     device: torch.device,
 ) -> float:
-    """MSE de traduction cross-modale.
-
-    source → workspace → target_reconstructed vs target_ground_truth
-    Plus c'est bas, mieux c'est.
-    """
+    """MSE de traduction cross-modale."""
     workspace.eval()
     total_mse = 0.0
     count = 0
@@ -108,16 +86,39 @@ def compute_translation_mse(
 
 
 @torch.no_grad()
+def show_translation_examples(
+    workspace: GlobalWorkspace,
+    dataloader: DataLoader,
+    tokenizer: SimpleTokenizer,
+    device: torch.device,
+    num_examples: int = 10,
+):
+    """Affiche des exemples de traduction image → texte."""
+    workspace.eval()
+    batch = next(iter(dataloader))
+    x_vision = batch["vision"][:num_examples].to(device)
+    x_text = batch["text"][:num_examples]
+
+    # Translate vision → text
+    text_logits = workspace.translate("vision", "text", x_vision)
+    predicted_ids = text_logits.argmax(dim=-1)
+
+    print("  --- Exemples image → texte ---")
+    for i in range(num_examples):
+        gt_text = tokenizer.decode(x_text[i])
+        pred_text = tokenizer.decode(predicted_ids[i].cpu())
+        print(f"  GT:   {gt_text}")
+        print(f"  Pred: {pred_text}")
+        print()
+
+
+@torch.no_grad()
 def compute_workspace_stats(
     workspace: GlobalWorkspace,
     dataloader: DataLoader,
     device: torch.device,
 ) -> Dict[str, float]:
-    """Stats de l'espace workspace pour debug.
-
-    Vérifie que les représentations sont bien distribuées
-    et que les domaines se chevauchent dans le workspace.
-    """
+    """Stats de l'espace workspace pour debug."""
     workspace.eval()
 
     domain_reprs = {name: [] for name in workspace.domain_modules}
@@ -157,6 +158,7 @@ def evaluate(
     eval_loader: DataLoader,
     config: dict,
     device: torch.device,
+    tokenizer: Optional[SimpleTokenizer] = None,
 ) -> Dict[str, float]:
     """Évaluation complète."""
     results = {}
@@ -184,6 +186,11 @@ def evaluate(
             key = f"translation_mse_{source}→{target}"
             results[key] = mse
             print(f"  {key}: {mse:.6f}")
+
+    # Traduction qualitative
+    if tokenizer is not None:
+        print()
+        show_translation_examples(workspace, eval_loader, tokenizer, device)
 
     # Workspace stats
     stats = compute_workspace_stats(workspace, eval_loader, device)

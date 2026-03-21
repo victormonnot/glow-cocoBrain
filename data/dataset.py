@@ -1,141 +1,128 @@
 """
-dataset.py — Dataset multimodal
-=================================
-Retourne des tuples alignés (vision, text, audio, ...) pour un même sample.
+dataset.py — Dataset COCO Captions pour GLoW
+==============================================
+Charge les features ResNet-50 pré-extraites + captions tokenisées.
 
-Deux modes :
-  1. DummyMultimodalDataset : données aléatoires pour tester la pipeline
-  2. MultimodalDataset      : squelette pour ton vrai dataset
+Chaque sample retourne:
+  {"vision": (2048,) features, "text": (max_seq_len,) token IDs}
 
-Le point clé : chaque sample contient TOUTES les modalités alignées.
-Si une modalité est manquante pour un sample, tu peux :
-  - Skip le sample
-  - Retourner None et gérer dans le collate_fn
-  - Masquer dans la loss
+Les paires sont aplaties : 118k images × 5 captions = ~590k paires train.
 """
 
+import json
+import os
+
+import numpy as np
 import torch
 from torch.utils.data import Dataset
-from typing import Dict, Optional
+from typing import Dict
 
-from data.transforms import vision_transform, text_transform, audio_transform
-
-
-class DummyMultimodalDataset(Dataset):
-    """Dataset de test avec données aléatoires.
-
-    Utile pour vérifier que la pipeline tourne de bout en bout
-    AVANT de brancher un vrai dataset. Si ça converge pas sur du
-    random, c'est que t'as un bug dans l'archi/les losses.
-    """
-
-    def __init__(
-        self,
-        num_samples: int = 10000,
-        image_size: int = 32,
-        image_channels: int = 3,
-        vocab_size: int = 10000,
-        seq_len: int = 64,
-        n_mels: int = 64,
-        audio_len: int = 64,
-    ):
-        self.num_samples = num_samples
-        self.image_size = image_size
-        self.image_channels = image_channels
-        self.vocab_size = vocab_size
-        self.seq_len = seq_len
-        self.n_mels = n_mels
-        self.audio_len = audio_len
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # Seed basé sur l'index pour reproductibilité
-        gen = torch.Generator().manual_seed(idx)
-
-        return {
-            "vision": torch.rand(
-                self.image_channels, self.image_size, self.image_size, generator=gen
-            ),
-            "text": torch.randint(
-                0, self.vocab_size, (self.seq_len,), generator=gen
-            ),
-            "audio": torch.randn(
-                self.n_mels, self.audio_len, generator=gen
-            ),
-        }
+from data.tokenizer import SimpleTokenizer
 
 
-class MultimodalDataset(Dataset):
-    """Squelette pour ton vrai dataset multimodal.
-
-    TODO: Implémente __getitem__ pour retourner tes vrais samples alignés.
-    Exemples de datasets réels :
-      - COCO Captions (image + texte)
-      - AudioCaps (audio + texte)
-      - HowTo100M (vidéo + audio + texte)
-    """
+class COCODataset(Dataset):
+    """Dataset COCO Captions avec features pré-extraites."""
 
     def __init__(
         self,
         data_root: str,
         split: str = "train",
-        max_seq_len: int = 64,
-        audio_target_len: int = 64,
+        max_seq_len: int = 32,
     ):
-        self.data_root = data_root
-        self.split = split
         self.max_seq_len = max_seq_len
-        self.audio_target_len = audio_target_len
 
-        # TODO: Charge ton index ici
-        # self.samples = load_index(data_root, split)
-        self.samples = []
+        # Load tokenizer
+        vocab_path = os.path.join(data_root, "vocab.json")
+        self.tokenizer = SimpleTokenizer.load(vocab_path)
+
+        # Load pre-extracted features
+        features_path = os.path.join(data_root, f"features_{split}.npy")
+        ids_path = os.path.join(data_root, f"image_ids_{split}.json")
+
+        self.features = np.load(features_path)  # (N_images, 2048)
+        with open(ids_path) as f:
+            image_ids = json.load(f)
+        # Mapping image_id → index in features array
+        self.id_to_idx = {img_id: idx for idx, img_id in enumerate(image_ids)}
+
+        # Load annotations and build (image_id, caption) pairs
+        ann_path = os.path.join(
+            data_root, "annotations", f"captions_{split}2017.json"
+        )
+        with open(ann_path) as f:
+            annotations = json.load(f)
+
+        self.samples = [
+            (ann["image_id"], ann["caption"])
+            for ann in annotations["annotations"]
+            if ann["image_id"] in self.id_to_idx
+        ]
+
+        print(
+            f"COCODataset({split}): {len(self.samples)} pairs, "
+            f"{len(self.id_to_idx)} images, "
+            f"vocab={self.tokenizer.vocab_size}"
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        sample = self.samples[idx]
+        image_id, caption = self.samples[idx]
 
-        result = {}
+        # Vision: pre-extracted ResNet-50 features
+        feat_idx = self.id_to_idx[image_id]
+        vision = torch.tensor(self.features[feat_idx], dtype=torch.float32)
 
-        # Vision
-        if "image_path" in sample:
-            # img = load_image(sample["image_path"])
-            # result["vision"] = vision_transform(img)
-            pass
+        # Text: tokenized caption
+        text = self.tokenizer.encode(caption, self.max_seq_len)
 
-        # Text
-        if "tokens" in sample:
-            # tokens = torch.tensor(sample["tokens"])
-            # result["text"] = text_transform(tokens, self.max_seq_len)
-            pass
-
-        # Audio
-        if "mel_path" in sample:
-            # mel = load_mel(sample["mel_path"])
-            # result["audio"] = audio_transform(mel, self.audio_target_len)
-            pass
-
-        return result
+        return {"vision": vision, "text": text}
 
 
-def get_dataset(config: dict) -> Dataset:
+class DummyMultimodalDataset(Dataset):
+    """Dataset de test avec données aléatoires (pour debug)."""
+
+    def __init__(
+        self,
+        num_samples: int = 10000,
+        feature_dim: int = 2048,
+        vocab_size: int = 10000,
+        seq_len: int = 32,
+    ):
+        self.num_samples = num_samples
+        self.feature_dim = feature_dim
+        self.vocab_size = vocab_size
+        self.seq_len = seq_len
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        gen = torch.Generator().manual_seed(idx)
+        return {
+            "vision": torch.rand(self.feature_dim, generator=gen),
+            "text": torch.randint(0, self.vocab_size, (self.seq_len,), generator=gen),
+        }
+
+
+def get_dataset(config: dict, split: str = "train") -> Dataset:
     """Factory : retourne le bon dataset selon la config."""
     name = config["data"]["dataset"]
 
     if name == "dummy":
         return DummyMultimodalDataset(
-            image_size=config["vision"]["input_size"],
-            image_channels=config["vision"]["input_channels"],
+            feature_dim=config["vision"]["feature_dim"],
             vocab_size=config["text"]["vocab_size"],
             seq_len=config["text"]["max_seq_len"],
-            n_mels=config["audio"]["n_mels"],
+        )
+    elif name == "coco":
+        return COCODataset(
+            data_root=config["data"]["data_root"],
+            split=split,
+            max_seq_len=config["text"]["max_seq_len"],
         )
     else:
         raise ValueError(
-            f"Dataset '{name}' pas implémenté. "
-            f"Ajoute-le dans dataset.py ou utilise 'dummy' pour tester."
+            f"Dataset '{name}' pas implémenté. Utilise 'dummy' ou 'coco'."
         )

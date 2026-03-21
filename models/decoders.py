@@ -1,12 +1,8 @@
 """
 decoders.py — Décodeurs domaine-spécifiques
 =============================================
-Miroir des encodeurs. Prend un vecteur latent z_d et reconstruit
-l'entrée brute du domaine.
-
-Utilisés pour :
-  1. La loss de reconstruction (autoencoder) en phase 1
-  2. La traduction cross-modale : workspace → domaine cible
+VisionDecoder : z_vision → features ResNet-50 reconstruites (2048)
+TextDecoder   : z_text → logits sur le vocabulaire (non-autorégressif)
 """
 
 import torch
@@ -14,46 +10,38 @@ import torch.nn as nn
 
 
 class VisionDecoder(nn.Module):
-    """z_vision → Image reconstruite."""
+    """z_vision → features ResNet-50 reconstruites.
 
-    def __init__(self, latent_dim: int = 256, hidden_dim: int = 128, output_channels: int = 3):
+    On reconstruit les features 2048-dim, pas les pixels.
+    Loss Phase 1 : MSE(features_hat, features_original).
+    """
+
+    def __init__(self, latent_dim: int = 512, feature_dim: int = 2048):
         super().__init__()
-        self.fc = nn.Linear(latent_dim, hidden_dim * 4 * 4 * 4)
-        self.hidden_dim = hidden_dim
-
         self.net = nn.Sequential(
-            # 4x4 → 8x8
-            nn.ConvTranspose2d(hidden_dim * 4, hidden_dim * 2, 4, stride=2, padding=1),
-            nn.BatchNorm2d(hidden_dim * 2),
-            nn.ReLU(),
-            # 8x8 → 16x16
-            nn.ConvTranspose2d(hidden_dim * 2, hidden_dim, 4, stride=2, padding=1),
-            nn.BatchNorm2d(hidden_dim),
-            nn.ReLU(),
-            # 16x16 → 32x32
-            nn.ConvTranspose2d(hidden_dim, output_channels, 4, stride=2, padding=1),
-            nn.Sigmoid(),  # Images normalisées [0, 1]
+            nn.Linear(latent_dim, latent_dim * 2),
+            nn.LayerNorm(latent_dim * 2),
+            nn.GELU(),
+            nn.Linear(latent_dim * 2, feature_dim),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, latent_dim) → x_hat: (B, C, 32, 32)"""
-        h = self.fc(z).view(-1, self.hidden_dim * 4, 4, 4)
-        return self.net(h)
+        """z: (B, latent_dim) → features_hat: (B, 2048)"""
+        return self.net(z)
 
 
 class TextDecoder(nn.Module):
     """z_text → Logits sur le vocabulaire pour chaque position.
 
-    Simplifié : on génère toute la séquence en parallèle (non-autorégressif).
-    Pour un vrai projet, passe en autorégressif avec masque causal.
+    Non-autorégressif : génère toute la séquence en parallèle.
     """
 
     def __init__(
         self,
-        latent_dim: int = 256,
-        embed_dim: int = 128,
+        latent_dim: int = 512,
+        embed_dim: int = 256,
         vocab_size: int = 10000,
-        max_seq_len: int = 64,
+        max_seq_len: int = 32,
         num_heads: int = 4,
         num_layers: int = 2,
     ):
@@ -79,25 +67,3 @@ class TextDecoder(nn.Module):
         h = h + self.pos_embedding(positions)
         h = self.transformer(h)
         return self.head(h)
-
-
-class AudioDecoder(nn.Module):
-    """z_audio → Mel spectrogram reconstruit."""
-
-    def __init__(self, latent_dim: int = 128, hidden_dim: int = 128, n_mels: int = 64, output_len: int = 64):
-        super().__init__()
-        self.output_len = output_len
-        self.fc = nn.Linear(latent_dim, hidden_dim * 2 * (output_len // 4))
-        self.hidden_dim = hidden_dim
-
-        self.net = nn.Sequential(
-            nn.ConvTranspose1d(hidden_dim * 2, hidden_dim, kernel_size=5, stride=2, padding=2, output_padding=1),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(),
-            nn.ConvTranspose1d(hidden_dim, n_mels, kernel_size=5, stride=2, padding=2, output_padding=1),
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """z: (B, latent_dim) → x_hat: (B, n_mels, T)"""
-        h = self.fc(z).view(-1, self.hidden_dim * 2, self.output_len // 4)
-        return self.net(h)

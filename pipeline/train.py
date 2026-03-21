@@ -4,30 +4,41 @@ train.py — Pipeline d'entraînement GLoW
 Entraînement en 2 phases :
 
   Phase 1 (Pretrain) : Chaque domaine s'entraîne comme autoencoder
-    indépendant. Le but est d'avoir des encodeurs/décodeurs qui
-    marchent AVANT d'aligner les domaines.
+    indépendant. Projections gelées.
     Loss = reconstruction par domaine.
 
-  Phase 2 (Align) : On freeze optionnellement les encodeurs/décodeurs
-    et on entraîne les projections + le workspace.
+  Phase 2 (Align) : On entraîne les projections + le workspace.
     Loss = contrastive + translation + cycle consistency.
-
-Pourquoi 2 phases ? Parce que si tu alignes des représentations
-qui ne veulent rien dire (encodeurs pas entraînés), tu alignes du bruit.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from itertools import combinations
-from tqdm import tqdm
 from typing import Dict, List, Tuple
 
 from models.workspace import GlobalWorkspace
 from losses.contrastive import ContrastiveLoss
 from losses.translation import TranslationLoss, TextTranslationLoss
 from losses.cycle import CycleConsistencyLoss, compute_cycle
+
+
+def _freeze_projections(workspace: GlobalWorkspace):
+    """Gèle les projections pour Phase 1."""
+    for module in workspace.domain_modules.values():
+        for p in module.projection.parameters():
+            p.requires_grad = False
+        for p in module.inv_projection.parameters():
+            p.requires_grad = False
+
+
+def _unfreeze_projections(workspace: GlobalWorkspace):
+    """Dégèle les projections pour Phase 2."""
+    for module in workspace.domain_modules.values():
+        for p in module.projection.parameters():
+            p.requires_grad = True
+        for p in module.inv_projection.parameters():
+            p.requires_grad = True
 
 
 def pretrain_epoch(
@@ -54,17 +65,19 @@ def pretrain_epoch(
             x = batch[name].to(device)
 
             if name == "text":
-                # Text : encode → decode → cross-entropy sur les logits
                 z = module.encode(x)
                 logits = module.decode(z)  # (B, seq_len, vocab_size)
                 B, S, V = logits.shape
-                loss += F.cross_entropy(logits.reshape(B * S, V), x.reshape(B * S))
+                loss += F.cross_entropy(
+                    logits.reshape(B * S, V), x.reshape(B * S), ignore_index=0
+                )
             else:
-                # Vision, Audio : reconstruction MSE
+                # Vision : MSE sur les features ResNet-50
                 x_hat = module.reconstruct(x)
                 loss += F.mse_loss(x_hat, x)
 
         loss.backward()
+        nn.utils.clip_grad_norm_(workspace.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item()
 
@@ -179,17 +192,30 @@ def train(
     lc = config["losses"]
 
     # ==================== PHASE 1 : Pretrain ====================
-    print("=" * 60)
-    print("PHASE 1 — Pretrain autoencoders")
-    print("=" * 60)
+    if tc["pretrain_epochs"] > 0:
+        print("=" * 60)
+        print("PHASE 1 — Pretrain autoencoders")
+        print("=" * 60)
 
-    optimizer = torch.optim.AdamW(
-        workspace.parameters(), lr=tc["pretrain_lr"], weight_decay=tc["weight_decay"]
-    )
+        _freeze_projections(workspace)
 
-    for epoch in range(tc["pretrain_epochs"]):
-        loss = pretrain_epoch(workspace, train_loader, optimizer, device)
-        print(f"  Epoch {epoch+1:3d}/{tc['pretrain_epochs']} — recon loss: {loss:.4f}")
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, workspace.parameters()),
+            lr=tc["pretrain_lr"],
+            weight_decay=tc["weight_decay"],
+        )
+
+        for epoch in range(tc["pretrain_epochs"]):
+            loss = pretrain_epoch(workspace, train_loader, optimizer, device)
+            print(f"  Epoch {epoch+1:3d}/{tc['pretrain_epochs']} — recon loss: {loss:.4f}")
+
+        torch.save(workspace.state_dict(), "checkpoint_pretrain.pt")
+        print("  Checkpoint Phase 1 sauvegardé: checkpoint_pretrain.pt")
+
+        _unfreeze_projections(workspace)
+    else:
+        print("Phase 1 skippée (pretrain checkpoint chargé)")
+        _unfreeze_projections(workspace)
 
     # ==================== PHASE 2 : Alignment ====================
     print()

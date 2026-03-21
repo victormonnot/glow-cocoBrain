@@ -1,42 +1,37 @@
 # ============================================================
-# GLoW Minimal — Configuration
+# GLoW cocoBrain — Configuration (Étape 1: COCO Vision+Text)
 # ============================================================
-# Tout est ici. Pas de magic numbers dans le code.
 
 seed: 42
 
 # --- Dimensions ---
-workspace_dim: 128          # Dimension de l'espace workspace partagé
+workspace_dim: 256
 latent_dims:
-  vision: 256               # Dim latente de l'encodeur vision
-  text: 256                 # Dim latente de l'encodeur texte
-  audio: 128                # Dim latente de l'encodeur audio
+  vision: 512
+  text: 512
 
-# --- Encodeurs/Décodeurs ---
+# --- Vision : features ResNet-50 pré-extraites ---
 vision:
-  input_channels: 3
-  input_size: 32            # Ex: CIFAR-like
-  hidden_dim: 128
+  feature_dim: 2048
 
+# --- Text : COCO Captions ---
 text:
   vocab_size: 10000
-  embed_dim: 128
-  max_seq_len: 64
-
-audio:
-  n_mels: 64
-  hidden_dim: 128
+  embed_dim: 256
+  max_seq_len: 32
+  num_heads: 4
+  num_layers: 2
 
 # --- Projections ---
 projection:
-  hidden_dim: 256           # MLP intermédiaire pour proj domain → workspace
+  hidden_dim: 512
   num_layers: 2
   dropout: 0.1
 
 # --- Workspace ---
 workspace:
-  fusion: "attention"       # "mean" | "attention"
-  num_heads: 4              # Si fusion == attention
+  fusion: "attention"
+  num_heads: 8
   num_layers: 2
 
 # --- Losses ---
@@ -47,39 +42,34 @@ losses:
   translation:
     weight: 1.0
   cycle:
-    weight: 0.5
-  reconstruction:           # Autoencoder loss par domaine
-    weight: 0.2
+    weight: 1.0
+  reconstruction:
+    weight: 1.0
 
 # --- Training ---
 training:
-  # Phase 1: Pré-entraîner les autoencoders domaine par domaine
-  pretrain_epochs: 10
-  pretrain_lr: 1.0e-3
+  pretrain_epochs: 20
+  pretrain_lr: 3.0e-4
 
-  # Phase 2: Entraîner l'alignement workspace
   align_epochs: 50
   align_lr: 5.0e-4
 
-  batch_size: 128
+  batch_size: 512
   weight_decay: 1.0e-5
   grad_clip: 1.0
 
-  # Quelles paires de domaines aligner (toutes les combos)
   domain_pairs:
     - ["vision", "text"]
-    - ["vision", "audio"]
-    - ["text", "audio"]
 
 # --- Data ---
 data:
-  dataset: "dummy"          # "dummy" pour tester, remplace par ton dataset
+  dataset: "coco"
+  data_root: "data/coco"
   num_workers: 4
-  train_split: 0.8
 
 # --- Logging ---
 logging:
   use_wandb: false
-  project: "glow-minimal"
+  project: "glow-cocoBrain"
   log_every: 50
-  eval_every: 5             # Éval tous les N epochs
+  eval_every: 10
