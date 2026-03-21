@@ -7,3 +7,5 @@ wandb
 pycocotools
 Pillow
 h5py
+scikit-learn
+matplotlib
