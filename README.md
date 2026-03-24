@@ -85,25 +85,36 @@ Training runs in 2 phases automatically:
 # Full training (Phase 1: pretrain autoencoders + Phase 2: workspace alignment)
 python main.py
 
+# Name your run for easy identification
+python main.py --name baseline
+
 # With a custom config
 python main.py --config path/to/config.yaml
 
 # Skip Phase 1 (resume from pretrain checkpoint)
-python main.py --resume_pretrain checkpoint_pretrain.pt
+python main.py --resume_pretrain checkpoints/run_001/checkpoint_pretrain.pt
 ```
 
 **Phase 1 — Pretrain autoencoders** (20 epochs): each domain learns to reconstruct its own input. Projections are frozen.
 
 **Phase 2 — Workspace alignment** (50 epochs): projections + workspace are trained with 3 losses (contrastive + translation + cycle consistency).
 
-Checkpoints saved:
-- `checkpoint_pretrain.pt` — after Phase 1
-- `checkpoint.pt` — after Phase 2 (final model)
+Each run creates a versioned directory in `checkpoints/`:
+```
+checkpoints/
+├── run_001_baseline/
+│   ├── config.yaml              # Config snapshot (exactly what was used)
+│   ├── checkpoint_pretrain.pt   # After Phase 1
+│   ├── checkpoint.pt            # Final model + config + eval results
+│   └── results.json             # Eval metrics (for easy comparison)
+├── run_002_ws384/
+│   └── ...
+```
 
 **Tip:** training takes a few hours on a 4070. Use tmux to keep it running:
 ```bash
 tmux new -s train
-python main.py
+python main.py --name my_experiment
 # Ctrl+B then D to detach
 # tmux attach -t train to come back
 ```
