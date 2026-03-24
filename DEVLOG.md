@@ -101,6 +101,52 @@ Pour le prochain training run :
 
 ---
 
+## 24 mars 2026 — Run 4 (run_001) : L2 norm features + ignore_index + workspace 384
+
+### Changements
+- L2 normalisation des features ResNet dans le dataset (chaque vecteur sur la sphère unitaire)
+- `ignore_index=0` dans `TextTranslationLoss` (ignorer le padding dans la translation loss Phase 2)
+- workspace_dim 256 → 384 (tester si plus d'espace aide)
+
+### Résultats
+
+| Métrique | Run 3 (baseline) | Run 4 | Diff |
+|---|---|---|---|
+| R@1 | 4.08% | 4.39% | +0.3 |
+| R@5 | 16.6% | 16.5% | ~pareil |
+| R@10 | 26.2% | 25.7% | -0.5 |
+| centroid_cos | 0.077 | -0.0095 | pire |
+
+**Diagnostic :** Retrieval quasi identique. Le centroid_cos est passé négatif — les représentations vision (norme ~17) et texte (norme ~11) vivent dans des sphères de tailles différentes dans le workspace. Le workspace_dim=384 a dispersé les représentations sans mieux les aligner.
+
+### Infra ajoutée ce jour
+- Système de run versionnées (`checkpoints/run_XXX_name/`)
+- Logs JSON par epoch (`log_pretrain.json`, `log_align.json`)
+- `results.json` pour comparaison facile entre runs
+- Phases séparables (`--phase pretrain`, `--phase align`)
+- Flag `--name` pour nommer les runs
+- README complet (setup, commandes, architecture)
+- DEVLOG.md (ce fichier)
+
+---
+
+## 24 mars 2026 — Run 5 (run_002_norm_ws_warmup) : fix normes + warmup
+
+### Changements
+- workspace_dim 384 → **256** (retour, le 384 n'a pas aidé)
+- **L2 normalisation dans le workspace** : `to_workspace()` applique `F.normalize` sur les w. Toutes les modalités projettent sur la même sphère unitaire. Fix le problème de normes différentes (17 vs 11).
+- **Warm-up contrastive** : le poids contrastive commence à 0.1x et monte linéairement vers 1.0x sur les 10 premières epochs (20% de 50). Donne le temps à la translation et cycle de s'installer avant que la contrastive compresse.
+
+### Ce qu'on espère
+- centroid_cos nettement plus élevé (les normes sont maintenant identiques = 1.0)
+- Retrieval en hausse grâce à un meilleur alignement
+- Losses qui descendent ensemble sans conflit grâce au warm-up
+
+### Résultats
+*(en attente — training en cours)*
+
+---
+
 ## Réflexions architecture (pas encore implémenté)
 
 ### GW dynamique vs statique
