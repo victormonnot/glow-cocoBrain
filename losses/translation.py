@@ -65,4 +65,5 @@ class TextTranslationLoss(nn.Module):
         return F.cross_entropy(
             predicted_logits.reshape(B * S, V),
             target_tokens.reshape(B * S),
+            ignore_index=0,
         )

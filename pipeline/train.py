@@ -185,6 +185,7 @@ def train(
     train_loader: DataLoader,
     config: dict,
     device: torch.device,
+    run_dir: str = ".",
 ):
     """Boucle d'entraînement complète : Phase 1 + Phase 2."""
 
@@ -209,8 +210,10 @@ def train(
             loss = pretrain_epoch(workspace, train_loader, optimizer, device)
             print(f"  Epoch {epoch+1:3d}/{tc['pretrain_epochs']} — recon loss: {loss:.4f}")
 
-        torch.save(workspace.state_dict(), "checkpoint_pretrain.pt")
-        print("  Checkpoint Phase 1 sauvegardé: checkpoint_pretrain.pt")
+        import os
+        pretrain_path = os.path.join(run_dir, "checkpoint_pretrain.pt")
+        torch.save(workspace.state_dict(), pretrain_path)
+        print(f"  Checkpoint Phase 1 sauvegardé: {pretrain_path}")
 
         _unfreeze_projections(workspace)
     else:

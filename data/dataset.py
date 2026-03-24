@@ -14,6 +14,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 from typing import Dict
 
@@ -73,6 +74,7 @@ class COCODataset(Dataset):
         # Vision: pre-extracted ResNet-50 features
         feat_idx = self.id_to_idx[image_id]
         vision = torch.tensor(self.features[feat_idx], dtype=torch.float32)
+        vision = F.normalize(vision, dim=-1)
 
         # Text: tokenized caption
         text = self.tokenizer.encode(caption, self.max_seq_len)

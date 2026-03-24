@@ -5,7 +5,7 @@
 seed: 42
 
 # --- Dimensions ---
-workspace_dim: 256
+workspace_dim: 384
 latent_dims:
   vision: 512
   text: 512
