@@ -11,6 +11,9 @@ Entraînement en 2 phases :
     Loss = contrastive + translation + cycle consistency.
 """
 
+import json
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -180,53 +183,66 @@ def align_epoch(
     return {k: v / n for k, v in metrics.items()}
 
 
-def train(
+def _save_log(log, run_dir, filename):
+    """Sauvegarde le training log en JSON (append-safe: écrit à chaque epoch)."""
+    path = os.path.join(run_dir, filename)
+    with open(path, "w") as f:
+        json.dump(log, f, indent=2)
+
+
+def train_pretrain(
     workspace: GlobalWorkspace,
     train_loader: DataLoader,
     config: dict,
     device: torch.device,
     run_dir: str = ".",
 ):
-    """Boucle d'entraînement complète : Phase 1 + Phase 2."""
+    """Phase 1 seule : Pretrain autoencoders."""
+    tc = config["training"]
 
+    print("=" * 60)
+    print("PHASE 1 — Pretrain autoencoders")
+    print("=" * 60)
+
+    _freeze_projections(workspace)
+
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, workspace.parameters()),
+        lr=tc["pretrain_lr"],
+        weight_decay=tc["weight_decay"],
+    )
+
+    log = []
+    for epoch in range(tc["pretrain_epochs"]):
+        loss = pretrain_epoch(workspace, train_loader, optimizer, device)
+        print(f"  Epoch {epoch+1:3d}/{tc['pretrain_epochs']} — recon loss: {loss:.4f}")
+        log.append({"epoch": epoch + 1, "recon_loss": loss})
+        _save_log(log, run_dir, "log_pretrain.json")
+
+    pretrain_path = os.path.join(run_dir, "checkpoint_pretrain.pt")
+    torch.save(workspace.state_dict(), pretrain_path)
+    print(f"  Checkpoint Phase 1 sauvegardé: {pretrain_path}")
+
+    _unfreeze_projections(workspace)
+
+
+def train_align(
+    workspace: GlobalWorkspace,
+    train_loader: DataLoader,
+    config: dict,
+    device: torch.device,
+    run_dir: str = ".",
+):
+    """Phase 2 seule : Workspace alignment."""
     tc = config["training"]
     lc = config["losses"]
 
-    # ==================== PHASE 1 : Pretrain ====================
-    if tc["pretrain_epochs"] > 0:
-        print("=" * 60)
-        print("PHASE 1 — Pretrain autoencoders")
-        print("=" * 60)
-
-        _freeze_projections(workspace)
-
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, workspace.parameters()),
-            lr=tc["pretrain_lr"],
-            weight_decay=tc["weight_decay"],
-        )
-
-        for epoch in range(tc["pretrain_epochs"]):
-            loss = pretrain_epoch(workspace, train_loader, optimizer, device)
-            print(f"  Epoch {epoch+1:3d}/{tc['pretrain_epochs']} — recon loss: {loss:.4f}")
-
-        import os
-        pretrain_path = os.path.join(run_dir, "checkpoint_pretrain.pt")
-        torch.save(workspace.state_dict(), pretrain_path)
-        print(f"  Checkpoint Phase 1 sauvegardé: {pretrain_path}")
-
-        _unfreeze_projections(workspace)
-    else:
-        print("Phase 1 skippée (pretrain checkpoint chargé)")
-        _unfreeze_projections(workspace)
-
-    # ==================== PHASE 2 : Alignment ====================
-    print()
     print("=" * 60)
     print("PHASE 2 — Workspace alignment")
     print("=" * 60)
 
-    # Loss functions
+    _unfreeze_projections(workspace)
+
     contrastive_fn = ContrastiveLoss(temperature=lc["contrastive"]["temperature"])
     translation_fn = TranslationLoss()
     text_translation_fn = TextTranslationLoss()
@@ -247,6 +263,7 @@ def train(
         optimizer, T_max=tc["align_epochs"]
     )
 
+    log = []
     for epoch in range(tc["align_epochs"]):
         metrics = align_epoch(
             workspace=workspace,
@@ -269,6 +286,28 @@ def train(
             f"trans: {metrics['translation']:.4f}  "
             f"cycle: {metrics['cycle']:.4f}"
         )
+        log.append({"epoch": epoch + 1, **metrics})
+        _save_log(log, run_dir, "log_align.json")
 
     print()
     print("Training terminé.")
+
+
+def train(
+    workspace: GlobalWorkspace,
+    train_loader: DataLoader,
+    config: dict,
+    device: torch.device,
+    run_dir: str = ".",
+):
+    """Boucle d'entraînement complète : Phase 1 + Phase 2."""
+    tc = config["training"]
+
+    if tc["pretrain_epochs"] > 0:
+        train_pretrain(workspace, train_loader, config, device, run_dir)
+    else:
+        print("Phase 1 skippée (pretrain checkpoint chargé)")
+        _unfreeze_projections(workspace)
+
+    print()
+    train_align(workspace, train_loader, config, device, run_dir)

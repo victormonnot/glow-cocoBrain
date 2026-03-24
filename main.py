@@ -24,7 +24,7 @@ from models.domain_module import DomainModule
 from models.workspace import GlobalWorkspace
 from data.dataset import get_dataset
 from data.tokenizer import SimpleTokenizer
-from pipeline.train import train
+from pipeline.train import train, train_pretrain, train_align
 from pipeline.eval import evaluate
 
 
@@ -113,6 +113,10 @@ def main():
         "--name", type=str, default=None,
         help="Optional run name (e.g. --name baseline)",
     )
+    parser.add_argument(
+        "--phase", type=str, default="both", choices=["pretrain", "align", "both"],
+        help="Which phase to run: pretrain, align, or both (default: both)",
+    )
     args = parser.parse_args()
 
     # --- Run directory ---
@@ -165,9 +169,17 @@ def main():
     if args.resume_pretrain:
         print(f"Loading pretrain checkpoint: {args.resume_pretrain}")
         workspace.load_state_dict(torch.load(args.resume_pretrain, map_location=device))
-        config["training"]["pretrain_epochs"] = 0  # Skip Phase 1
 
-    train(workspace, train_loader, config, device, run_dir=run_dir)
+    if args.phase == "pretrain":
+        train_pretrain(workspace, train_loader, config, device, run_dir=run_dir)
+    elif args.phase == "align":
+        if not args.resume_pretrain:
+            print("WARNING: --phase align sans --resume_pretrain, les autoencoders ne sont pas pretrained!")
+        train_align(workspace, train_loader, config, device, run_dir=run_dir)
+    else:  # both
+        if args.resume_pretrain:
+            config["training"]["pretrain_epochs"] = 0
+        train(workspace, train_loader, config, device, run_dir=run_dir)
 
     # --- Eval ---
     tokenizer = SimpleTokenizer.load(
