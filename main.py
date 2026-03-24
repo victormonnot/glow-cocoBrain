@@ -9,6 +9,11 @@ Usage:
 """
 
 import argparse
+import json
+import os
+import shutil
+from datetime import datetime
+
 import yaml
 import torch
 from torch.utils.data import DataLoader
@@ -84,6 +89,17 @@ def build_domain_modules(config: dict) -> dict:
     return modules
 
 
+def create_run_dir(name=None):
+    """Crée un dossier checkpoints/run_XXX/ pour cette run."""
+    os.makedirs("checkpoints", exist_ok=True)
+    existing = [d for d in os.listdir("checkpoints") if d.startswith("run_")]
+    next_num = max([int(d.split("_")[1]) for d in existing], default=0) + 1
+    suffix = f"_{name}" if name else ""
+    run_dir = f"checkpoints/run_{next_num:03d}{suffix}"
+    os.makedirs(run_dir)
+    return run_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description="GLoW cocoBrain Training")
     parser.add_argument(
@@ -93,10 +109,19 @@ def main():
         "--resume_pretrain", type=str, default=None,
         help="Path to pretrain checkpoint (skip Phase 1)",
     )
+    parser.add_argument(
+        "--name", type=str, default=None,
+        help="Optional run name (e.g. --name baseline)",
+    )
     args = parser.parse_args()
+
+    # --- Run directory ---
+    run_dir = create_run_dir(args.name)
+    print(f"Run directory: {run_dir}")
 
     # --- Config ---
     config = load_config(args.config)
+    shutil.copy2(args.config, os.path.join(run_dir, "config.yaml"))
     torch.manual_seed(config["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -142,7 +167,7 @@ def main():
         workspace.load_state_dict(torch.load(args.resume_pretrain, map_location=device))
         config["training"]["pretrain_epochs"] = 0  # Skip Phase 1
 
-    train(workspace, train_loader, config, device)
+    train(workspace, train_loader, config, device, run_dir=run_dir)
 
     # --- Eval ---
     tokenizer = SimpleTokenizer.load(
@@ -151,13 +176,24 @@ def main():
     results = evaluate(workspace, val_loader, config, device, tokenizer)
 
     # --- Save ---
-    save_path = "checkpoint.pt"
+    save_path = os.path.join(run_dir, "checkpoint.pt")
     torch.save({
         "model_state_dict": workspace.state_dict(),
         "config": config,
         "eval_results": results,
     }, save_path)
     print(f"\nCheckpoint sauvegardé: {save_path}")
+
+    # Save eval results as JSON for easy comparison
+    results_path = os.path.join(run_dir, "results.json")
+    with open(results_path, "w") as f:
+        json.dump({
+            "timestamp": datetime.now().isoformat(),
+            "name": args.name,
+            "metrics": {k: float(v) if hasattr(v, '__float__') else v
+                        for k, v in results.items()},
+        }, f, indent=2)
+    print(f"Résultats sauvegardés: {results_path}")
 
 
 if __name__ == "__main__":
