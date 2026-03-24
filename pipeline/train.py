@@ -263,8 +263,19 @@ def train_align(
         optimizer, T_max=tc["align_epochs"]
     )
 
+    # Warm-up contrastive: 0.1 -> 1.0 over first 20% of epochs
+    warmup_epochs = max(1, tc["align_epochs"] // 5)
+    base_contrastive_weight = loss_weights["contrastive"]
+
     log = []
     for epoch in range(tc["align_epochs"]):
+        # Warm-up contrastive weight
+        if epoch < warmup_epochs:
+            ratio = 0.1 + 0.9 * (epoch / warmup_epochs)
+            loss_weights["contrastive"] = base_contrastive_weight * ratio
+        else:
+            loss_weights["contrastive"] = base_contrastive_weight
+
         metrics = align_epoch(
             workspace=workspace,
             dataloader=train_loader,
@@ -285,8 +296,9 @@ def train_align(
             f"contr: {metrics['contrastive']:.4f}  "
             f"trans: {metrics['translation']:.4f}  "
             f"cycle: {metrics['cycle']:.4f}"
+            f"{'  [warmup]' if epoch < warmup_epochs else ''}"
         )
-        log.append({"epoch": epoch + 1, **metrics})
+        log.append({"epoch": epoch + 1, "contrastive_weight": loss_weights["contrastive"], **metrics})
         _save_log(log, run_dir, "log_align.json")
 
     print()
