@@ -82,17 +82,20 @@ data/coco/
 Training runs in 2 phases automatically:
 
 ```bash
-# Full training (Phase 1: pretrain autoencoders + Phase 2: workspace alignment)
-python main.py
-
-# Name your run for easy identification
+# Full training (Phase 1 + Phase 2)
 python main.py --name baseline
 
 # With a custom config
-python main.py --config path/to/config.yaml
+python main.py --config path/to/config.yaml --name my_experiment
 
-# Skip Phase 1 (resume from pretrain checkpoint)
-python main.py --resume_pretrain checkpoints/run_001/checkpoint_pretrain.pt
+# Phase 1 only (pretrain autoencoders)
+python main.py --phase pretrain --name pretrain_v1
+
+# Phase 2 only (workspace alignment, reusing Phase 1 from a previous run)
+python main.py --phase align --resume_pretrain checkpoints/run_001_pretrain_v1/checkpoint_pretrain.pt --name align_ws384
+
+# Iterate on Phase 2 with different hyperparams without redoing Phase 1
+python main.py --phase align --resume_pretrain checkpoints/run_001_pretrain_v1/checkpoint_pretrain.pt --name align_cycle2x
 ```
 
 **Phase 1 — Pretrain autoencoders** (20 epochs): each domain learns to reconstruct its own input. Projections are frozen.
@@ -102,13 +105,23 @@ python main.py --resume_pretrain checkpoints/run_001/checkpoint_pretrain.pt
 Each run creates a versioned directory in `checkpoints/`:
 ```
 checkpoints/
-├── run_001_baseline/
+├── run_001_pretrain_v1/
 │   ├── config.yaml              # Config snapshot (exactly what was used)
 │   ├── checkpoint_pretrain.pt   # After Phase 1
-│   ├── checkpoint.pt            # Final model + config + eval results
-│   └── results.json             # Eval metrics (for easy comparison)
-├── run_002_ws384/
+│   ├── log_pretrain.json        # Loss per epoch (Phase 1)
 │   └── ...
+├── run_002_align_ws384/
+│   ├── config.yaml
+│   ├── checkpoint.pt            # Final model + config + eval results
+│   ├── log_align.json           # Losses per epoch (Phase 2)
+│   └── results.json             # Eval metrics (for easy comparison)
+├── run_003_baseline/            # --phase both: has everything
+│   ├── config.yaml
+│   ├── checkpoint_pretrain.pt
+│   ├── checkpoint.pt
+│   ├── log_pretrain.json
+│   ├── log_align.json
+│   └── results.json
 ```
 
 **Tip:** training takes a few hours on a 4070. Use tmux to keep it running:
