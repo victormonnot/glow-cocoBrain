@@ -59,8 +59,8 @@ class DomainModule(nn.Module):
         return self.decoder(z)
 
     def to_workspace(self, z: torch.Tensor) -> torch.Tensor:
-        """Latent domaine → espace workspace (L2 normalized)."""
-        return F.normalize(self.projection(z), dim=-1)
+        """Latent domaine → espace workspace."""
+        return self.projection(z)
 
     def from_workspace(self, w: torch.Tensor) -> torch.Tensor:
         """Espace workspace → latent domaine."""

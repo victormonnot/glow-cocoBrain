@@ -41,6 +41,7 @@ class DomainProjection(nn.Module):
             ])
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, workspace_dim))
+        layers.append(nn.LayerNorm(workspace_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -75,6 +76,7 @@ class InverseProjection(nn.Module):
             ])
             in_dim = hidden_dim
         layers.append(nn.Linear(in_dim, latent_dim))
+        layers.append(nn.LayerNorm(latent_dim))
         self.net = nn.Sequential(*layers)
 
     def forward(self, w: torch.Tensor) -> torch.Tensor:

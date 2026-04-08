@@ -5,10 +5,15 @@ Entraînement en 2 phases :
 
   Phase 1 (Pretrain) : Chaque domaine s'entraîne comme autoencoder
     indépendant. Projections gelées.
-    Loss = reconstruction par domaine.
+    Loss = MSE reconstruction par domaine.
 
-  Phase 2 (Align) : On entraîne les projections + le workspace.
-    Loss = contrastive + translation + cycle consistency.
+  Phase 2 (Align) : On entraîne les projections.
+    Losses (terminologie shimmer) :
+      - Lcont : contrastive (InfoNCE) sur les w — PAIRED ONLY
+      - Ltr   : translation — cross-modale via le décodeur (MSE) — PAIRED ONLY
+      - Ldcy  : demi-cycle — same-domain sur les latents — ALL DATA
+      - Lcy   : cycle — round-trip z_a → w → z_b → w → z_a — ALL DATA
+      - Lfusion: weighted-sum + Tanh (anti-dégénérescence) — ALL DATA
 """
 
 import json
@@ -22,8 +27,8 @@ from typing import Dict, List, Tuple
 
 from models.workspace import GlobalWorkspace
 from losses.contrastive import ContrastiveLoss
-from losses.translation import TranslationLoss, TextTranslationLoss
 from losses.cycle import CycleConsistencyLoss, compute_cycle
+from pipeline.diagnostics import compute_diagnostics, DiagnosticsLogger
 
 
 def _freeze_projections(workspace: GlobalWorkspace):
@@ -52,7 +57,8 @@ def pretrain_epoch(
 ) -> float:
     """Phase 1 : Entraîne chaque domaine comme autoencoder.
 
-    Loss = Σ_d reconstruction_loss(x_d, decode_d(encode_d(x_d)))
+    Loss = Σ_d MSE(x_d, decode_d(encode_d(x_d)))
+    Les deux modalités utilisent MSE (vision sur features, texte sur E5 embeddings).
     """
     workspace.train()
     total_loss = 0.0
@@ -66,18 +72,8 @@ def pretrain_epoch(
                 continue
 
             x = batch[name].to(device)
-
-            if name == "text":
-                z = module.encode(x)
-                logits = module.decode(z)  # (B, seq_len, vocab_size)
-                B, S, V = logits.shape
-                loss += F.cross_entropy(
-                    logits.reshape(B * S, V), x.reshape(B * S), ignore_index=0
-                )
-            else:
-                # Vision : MSE sur les features ResNet-50
-                x_hat = module.reconstruct(x)
-                loss += F.mse_loss(x_hat, x)
+            x_hat = module.reconstruct(x)
+            loss += F.mse_loss(x_hat, x)
 
         loss.backward()
         nn.utils.clip_grad_norm_(workspace.parameters(), max_norm=1.0)
@@ -85,6 +81,24 @@ def pretrain_epoch(
         total_loss += loss.item()
 
     return total_loss / len(dataloader)
+
+
+def _freeze_encoders_decoders(workspace: GlobalWorkspace):
+    """Gèle les encodeurs et décodeurs pour Phase 2."""
+    for module in workspace.domain_modules.values():
+        for p in module.encoder.parameters():
+            p.requires_grad = False
+        for p in module.decoder.parameters():
+            p.requires_grad = False
+
+
+def _unfreeze_encoders_decoders(workspace: GlobalWorkspace):
+    """Dégèle les encodeurs et décodeurs."""
+    for module in workspace.domain_modules.values():
+        for p in module.encoder.parameters():
+            p.requires_grad = True
+        for p in module.decoder.parameters():
+            p.requires_grad = True
 
 
 def align_epoch(
@@ -95,35 +109,50 @@ def align_epoch(
     domain_pairs: List[Tuple[str, str]],
     loss_weights: Dict[str, float],
     contrastive_loss_fn: ContrastiveLoss,
-    translation_loss_fn: TranslationLoss,
-    text_translation_loss_fn: TextTranslationLoss,
     cycle_loss_fn: CycleConsistencyLoss,
 ) -> Dict[str, float]:
     """Phase 2 : Aligne les domaines dans le workspace.
 
-    Pour chaque paire (A, B) :
-      1. Contrastive   : w_a proche de w_b (même sample)
-      2. Translation   : x_a → workspace → x̂_b ≈ x_b (et inversement)
-      3. Cycle         : z_a → w → z_b → w → ẑ_a ≈ z_a
+    Encodeurs/décodeurs sont frozen. Seules les projections s'entraînent.
+
+    Semi-supervised (20% paired) :
+      - Lcont et Ltr : seulement sur les samples paired
+      - Ldcy, Lcy, Lfusion : sur TOUS les samples
+
+    Fusion : weighted-sum + Tanh (comme Multimodal Dreaming).
     """
     workspace.train()
-    metrics = {"contrastive": 0.0, "translation": 0.0, "cycle": 0.0, "total": 0.0}
+    beta_dist = torch.distributions.Beta(5.0, 5.0)
+    metrics = {
+        "contrastive": 0.0, "translation": 0.0,
+        "demi_cycle": 0.0, "cycle": 0.0, "fusion": 0.0, "total": 0.0,
+        "mean_pos_per_anchor": 0.0,
+    }
 
     for batch in dataloader:
         optimizer.zero_grad()
 
         # Encode tout et projette dans le workspace
         inputs = {name: batch[name].to(device) for name in batch if name in workspace.domain_modules}
+        image_ids = batch.get("image_id", None)
+        if image_ids is not None:
+            image_ids = image_ids.to(device)
+        is_paired = batch.get("is_paired", None)
+        if is_paired is not None:
+            is_paired = is_paired.to(device)
+
         workspace_reprs = workspace.encode_domains(inputs)
 
-        # Aussi besoin des latents (avant projection) pour le cycle
+        # Latents (avant projection) — detach car encodeurs frozen
         latents = {}
         for name in inputs:
-            latents[name] = workspace.domain_modules[name].encode(inputs[name])
+            latents[name] = workspace.domain_modules[name].encode(inputs[name]).detach()
 
         loss_contrastive = torch.tensor(0.0, device=device)
         loss_translation = torch.tensor(0.0, device=device)
+        loss_demi_cycle = torch.tensor(0.0, device=device)
         loss_cycle = torch.tensor(0.0, device=device)
+        loss_fusion = torch.tensor(0.0, device=device)
 
         for (name_a, name_b) in domain_pairs:
             if name_a not in workspace_reprs or name_b not in workspace_reprs:
@@ -134,40 +163,58 @@ def align_epoch(
             mod_a = workspace.domain_modules[name_a]
             mod_b = workspace.domain_modules[name_b]
 
-            # --- 1. Contrastive ---
-            loss_contrastive += contrastive_loss_fn(w_a, w_b)
+            # === SUPERVISED LOSSES (paired only) ===
+            paired_mask = is_paired if is_paired is not None else None
+            has_paired = paired_mask is not None and paired_mask.any()
 
-            # --- 2. Translation (A → B et B → A) ---
-            # A → workspace → B
-            z_b_hat = mod_b.from_workspace(w_a)
-            x_b_hat = mod_b.decode(z_b_hat)
+            if has_paired:
+                w_a_p = w_a[paired_mask]
+                w_b_p = w_b[paired_mask]
+                ids_p = image_ids[paired_mask] if image_ids is not None else None
 
-            if name_b == "text":
-                loss_translation += text_translation_loss_fn(inputs[name_b], x_b_hat)
-            else:
-                loss_translation += translation_loss_fn(inputs[name_b], x_b_hat)
+                # --- 1. Contrastive (Lcont) — multi-positifs, paired only ---
+                loss_contrastive += contrastive_loss_fn(w_a_p, w_b_p, image_ids=ids_p)
 
-            # B → workspace → A
-            z_a_hat = mod_a.from_workspace(w_b)
-            x_a_hat = mod_a.decode(z_a_hat)
+                # --- 2. Translation (Ltr) — MSE through frozen decoder, paired only ---
+                z_b_hat_p = mod_b.from_workspace(w_a_p)
+                x_b_hat_p = mod_b.decode(z_b_hat_p)
+                loss_translation += F.mse_loss(x_b_hat_p, inputs[name_b][paired_mask])
 
-            if name_a == "text":
-                loss_translation += text_translation_loss_fn(inputs[name_a], x_a_hat)
-            else:
-                loss_translation += translation_loss_fn(inputs[name_a], x_a_hat)
+                z_a_hat_p = mod_a.from_workspace(w_b_p)
+                x_a_hat_p = mod_a.decode(z_a_hat_p)
+                loss_translation += F.mse_loss(x_a_hat_p, inputs[name_a][paired_mask])
 
-            # --- 3. Cycle consistency ---
+            # === UNSUPERVISED LOSSES (all data) ===
+
+            # --- 3. Demi-cycle (Ldcy) — same-domain reconstruction ---
+            # z_a → proj_a → w_a → inv_proj_a → z_a_hat (unsupervised)
+            z_a_dcy = mod_a.from_workspace(w_a)
+            loss_demi_cycle += F.mse_loss(z_a_dcy, latents[name_a])
+            z_b_dcy = mod_b.from_workspace(w_b)
+            loss_demi_cycle += F.mse_loss(z_b_dcy, latents[name_b])
+
+            # --- 4. Cycle (Lcy) — round-trip, only needs z_a as target ---
             z_a_cycle = compute_cycle(mod_a, mod_b, latents[name_a])
-            loss_cycle += cycle_loss_fn(latents[name_a].detach(), z_a_cycle)
+            loss_cycle += cycle_loss_fn(latents[name_a], z_a_cycle)
 
             z_b_cycle = compute_cycle(mod_b, mod_a, latents[name_b])
-            loss_cycle += cycle_loss_fn(latents[name_b].detach(), z_b_cycle)
+            loss_cycle += cycle_loss_fn(latents[name_b], z_b_cycle)
+
+            # --- 5. Fusion (Lfusion) — weighted-sum + Tanh ---
+            alpha = beta_dist.sample().to(device)
+            w_fused = torch.tanh(alpha * w_a + (1 - alpha) * w_b)
+            z_a_from_fused = mod_a.from_workspace(w_fused)
+            z_b_from_fused = mod_b.from_workspace(w_fused)
+            loss_fusion += F.mse_loss(z_a_from_fused, latents[name_a])
+            loss_fusion += F.mse_loss(z_b_from_fused, latents[name_b])
 
         # Pondération
         total_loss = (
             loss_weights["contrastive"] * loss_contrastive
             + loss_weights["translation"] * loss_translation
+            + loss_weights["demi_cycle"] * loss_demi_cycle
             + loss_weights["cycle"] * loss_cycle
+            + loss_weights["fusion"] * loss_fusion
         )
 
         total_loss.backward()
@@ -176,8 +223,16 @@ def align_epoch(
 
         metrics["contrastive"] += loss_contrastive.item()
         metrics["translation"] += loss_translation.item()
+        metrics["demi_cycle"] += loss_demi_cycle.item()
         metrics["cycle"] += loss_cycle.item()
+        metrics["fusion"] += loss_fusion.item()
         metrics["total"] += total_loss.item()
+
+        # Log mean positives per anchor (excluding self-match)
+        if has_paired and ids_p is not None:
+            pos_mask = ids_p.unsqueeze(1) == ids_p.unsqueeze(0)
+            pos_mask.fill_diagonal_(False)
+            metrics["mean_pos_per_anchor"] += pos_mask.float().sum(dim=1).mean().item()
 
     n = len(dataloader)
     return {k: v / n for k, v in metrics.items()}
@@ -232,6 +287,7 @@ def train_align(
     config: dict,
     device: torch.device,
     run_dir: str = ".",
+    val_loader: DataLoader = None,
 ):
     """Phase 2 seule : Workspace alignment."""
     tc = config["training"]
@@ -241,41 +297,52 @@ def train_align(
     print("PHASE 2 — Workspace alignment")
     print("=" * 60)
 
+    # Freeze encodeurs/décodeurs, unfreeze projections
+    _freeze_encoders_decoders(workspace)
     _unfreeze_projections(workspace)
 
+    trainable = sum(p.numel() for p in workspace.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in workspace.parameters())
+    print(f"  Params trainables: {trainable:,} / {total:,} (encodeurs/decodeurs frozen)")
+
     contrastive_fn = ContrastiveLoss(temperature=lc["contrastive"]["temperature"])
-    translation_fn = TranslationLoss()
-    text_translation_fn = TextTranslationLoss()
     cycle_fn = CycleConsistencyLoss()
 
     loss_weights = {
         "contrastive": lc["contrastive"]["weight"],
         "translation": lc["translation"]["weight"],
+        "demi_cycle": lc["demi_cycle"]["weight"],
         "cycle": lc["cycle"]["weight"],
+        "fusion": lc["fusion"]["weight"],
     }
 
     domain_pairs = [tuple(p) for p in tc["domain_pairs"]]
 
+    # Optimizer only on trainable params (projections)
     optimizer = torch.optim.AdamW(
-        workspace.parameters(), lr=tc["align_lr"], weight_decay=tc["weight_decay"]
+        filter(lambda p: p.requires_grad, workspace.parameters()),
+        lr=tc["align_lr"], weight_decay=tc["weight_decay"]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=tc["align_epochs"]
     )
 
-    # Warm-up contrastive: 0.1 -> 1.0 over first 20% of epochs
-    warmup_epochs = max(1, tc["align_epochs"] // 5)
-    base_contrastive_weight = loss_weights["contrastive"]
+    # wandb
+    use_wandb = config.get("logging", {}).get("use_wandb", False)
+    if use_wandb:
+        import wandb
+        wandb.init(
+            project=config["logging"]["project"],
+            name=os.path.basename(run_dir),
+            config=config,
+            dir=run_dir,
+        )
+
+    # Diagnostics logger
+    diag_logger = DiagnosticsLogger(run_dir, use_wandb=use_wandb) if val_loader is not None else None
 
     log = []
     for epoch in range(tc["align_epochs"]):
-        # Warm-up contrastive weight
-        if epoch < warmup_epochs:
-            ratio = 0.1 + 0.9 * (epoch / warmup_epochs)
-            loss_weights["contrastive"] = base_contrastive_weight * ratio
-        else:
-            loss_weights["contrastive"] = base_contrastive_weight
-
         metrics = align_epoch(
             workspace=workspace,
             dataloader=train_loader,
@@ -284,22 +351,52 @@ def train_align(
             domain_pairs=domain_pairs,
             loss_weights=loss_weights,
             contrastive_loss_fn=contrastive_fn,
-            translation_loss_fn=translation_fn,
-            text_translation_loss_fn=text_translation_fn,
             cycle_loss_fn=cycle_fn,
         )
         scheduler.step()
+
+        # Diagnostics on fixed val subset
+        diag_str = ""
+        if diag_logger is not None:
+            diag = compute_diagnostics(workspace, val_loader, device, contrastive_fn)
+            diag_logger.log(epoch + 1, diag)
+            diag_str = (
+                f"  val: cos_gap={diag['cos_gap']:.3f} "
+                f"centr={diag['centroid_cos']:.3f} "
+                f"R@1={diag['retrieval_i2t_R@1']:.3f}"
+            )
 
         print(
             f"  Epoch {epoch+1:3d}/{tc['align_epochs']} — "
             f"total: {metrics['total']:.4f}  "
             f"contr: {metrics['contrastive']:.4f}  "
             f"trans: {metrics['translation']:.4f}  "
-            f"cycle: {metrics['cycle']:.4f}"
-            f"{'  [warmup]' if epoch < warmup_epochs else ''}"
+            f"dcy: {metrics['demi_cycle']:.4f}  "
+            f"cy: {metrics['cycle']:.4f}  "
+            f"fus: {metrics['fusion']:.4f}"
+            f"{diag_str}"
         )
-        log.append({"epoch": epoch + 1, "contrastive_weight": loss_weights["contrastive"], **metrics})
+        # wandb train losses
+        if use_wandb:
+            wandb.log({
+                "train/total": metrics["total"],
+                "train/contrastive": metrics["contrastive"],
+                "train/translation": metrics["translation"],
+                "train/demi_cycle": metrics["demi_cycle"],
+                "train/cycle": metrics["cycle"],
+                "train/fusion": metrics["fusion"],
+                "train/mean_pos_per_anchor": metrics["mean_pos_per_anchor"],
+                "train/lr": optimizer.param_groups[0]["lr"],
+            }, step=epoch + 1)
+
+        log.append({"epoch": epoch + 1, **metrics})
         _save_log(log, run_dir, "log_align.json")
+
+    # Unfreeze tout pour l'eval/inference
+    _unfreeze_encoders_decoders(workspace)
+
+    if use_wandb:
+        wandb.finish()
 
     print()
     print("Training terminé.")
@@ -311,6 +408,7 @@ def train(
     config: dict,
     device: torch.device,
     run_dir: str = ".",
+    val_loader: DataLoader = None,
 ):
     """Boucle d'entraînement complète : Phase 1 + Phase 2."""
     tc = config["training"]
@@ -322,4 +420,4 @@ def train(
         _unfreeze_projections(workspace)
 
     print()
-    train_align(workspace, train_loader, config, device, run_dir)
+    train_align(workspace, train_loader, config, device, run_dir, val_loader=val_loader)

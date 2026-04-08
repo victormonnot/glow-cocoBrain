@@ -1,50 +1,43 @@
 # ============================================================
 # GLoW cocoBrain — Configuration (Étape 1: COCO Vision+Text)
+# Run 13 — Refonte alignée sur les papiers du lab
 # ============================================================
 
 seed: 42
 
 # --- Dimensions ---
-workspace_dim: 256
+workspace_dim: 64         # <- était 384 (le lab utilise 10-60)
 latent_dims:
-  vision: 512
-  text: 512
+  vision: 128             # <- était 512
+  text: 128               # <- était 512
 
 # --- Vision : features ResNet-50 pré-extraites ---
 vision:
   feature_dim: 2048
 
-# --- Text : COCO Captions ---
+# --- Text : embeddings E5-large-v2 pré-extraits ---
 text:
-  vocab_size: 10000
-  embed_dim: 256
-  max_seq_len: 32
-  num_heads: 4
-  num_layers: 2
+  feature_dim: 1024       # E5-large-v2 output dim
 
 # --- Projections ---
 projection:
-  hidden_dim: 512
-  num_layers: 2
+  hidden_dim: 256         # <- était 512
+  num_layers: 6           # <- était 2 (le lab utilise 4-8)
   dropout: 0.1
-
-# --- Workspace ---
-workspace:
-  fusion: "attention"
-  num_heads: 8
-  num_layers: 2
 
 # --- Losses ---
 losses:
   contrastive:
-    temperature: 0.07
+    temperature: 0.1
+    weight: 0.1           # <- était 1.0 (le lab utilise 0.05-0.1)
+  translation:            # Ltr — through decoder (observation space)
+    weight: 1.0           # <- était 0.1 (le lab utilise 1.0)
+  demi_cycle:             # Ldcy — on latents (z space)
     weight: 1.0
-  translation:
+  cycle:                  # Lcy — round-trip z_a → w → z_b → w → z_a
     weight: 1.0
-  cycle:
-    weight: 1.0
-  reconstruction:
-    weight: 1.0
+  fusion:                 # Lfusion — weighted-sum + Tanh, alpha ~ Beta(5,5)
+    weight: 1.0           # <- était 5.0 (le bottleneck 64-dim suffit)
 
 # --- Training ---
 training:
@@ -57,6 +50,7 @@ training:
   batch_size: 512
   weight_decay: 1.0e-5
   grad_clip: 1.0
+  paired_fraction: 0.2   # 20% des données appariées pour Ltr et Lcont
 
   domain_pairs:
     - ["vision", "text"]
@@ -69,7 +63,6 @@ data:
 
 # --- Logging ---
 logging:
-  use_wandb: false
+  use_wandb: true
   project: "glow-cocoBrain"
   log_every: 50
-  eval_every: 10

@@ -9,11 +9,9 @@ Inspiré de la Global Workspace Theory (Baars, 1988) :
   - Le workspace fusionne les représentations
   - Le résultat est "broadcasté" à tous les modules
 
-Deux modes de fusion :
-  "mean"      : Moyenne simple des w_d. Baseline.
-  "attention" : Cross-attention entre les w_d. Plus expressif,
-                permet au workspace de pondérer dynamiquement
-                les contributions de chaque domaine.
+Fusion : somme pondérée + Tanh (comme Multimodal Dreaming, VanRullen 2025).
+Pas d'attention — la somme pondérée fixe est non-contournable,
+ce qui empêche la dégénérescence aux pôles opposés.
 """
 
 import torch
@@ -33,28 +31,10 @@ class GlobalWorkspace(nn.Module):
         self,
         domain_modules: Dict[str, DomainModule],
         workspace_dim: int,
-        fusion: str = "attention",
-        num_heads: int = 4,
-        num_layers: int = 2,
     ):
         super().__init__()
         self.domain_modules = nn.ModuleDict(domain_modules)
         self.workspace_dim = workspace_dim
-        self.fusion_type = fusion
-
-        if fusion == "attention":
-            # Cross-attention : chaque domaine "attend" aux autres
-            layer = nn.TransformerEncoderLayer(
-                d_model=workspace_dim,
-                nhead=num_heads,
-                dim_feedforward=workspace_dim * 4,
-                batch_first=True,
-            )
-            self.fusion_net = nn.TransformerEncoder(layer, num_layers=num_layers)
-        elif fusion == "mean":
-            self.fusion_net = None
-        else:
-            raise ValueError(f"Fusion inconnue: {fusion}. Utilise 'mean' ou 'attention'.")
 
     def encode_domains(
         self, inputs: Dict[str, torch.Tensor]
@@ -77,29 +57,21 @@ class GlobalWorkspace(nn.Module):
     def fuse(self, workspace_reprs: Dict[str, torch.Tensor]) -> torch.Tensor:
         """Fusionne les représentations workspace de plusieurs domaines.
 
+        Weighted sum + Tanh (comme le lab).
+
         Args:
             workspace_reprs: {"vision": w_v, "text": w_t, ...}
                             Chaque w_d est (B, workspace_dim)
 
         Returns:
-            w_fused: (B, workspace_dim) — la représentation unifiée.
+            w_fused: (B, workspace_dim) — la représentation unifiée, bornée [-1, 1].
         """
         if len(workspace_reprs) == 1:
-            # Un seul domaine, pas de fusion nécessaire
-            return next(iter(workspace_reprs.values()))
+            return torch.tanh(next(iter(workspace_reprs.values())))
 
-        if self.fusion_type == "mean":
-            # Moyenne simple
-            stacked = torch.stack(list(workspace_reprs.values()), dim=0)  # (N, B, D)
-            return stacked.mean(dim=0)
-
-        elif self.fusion_type == "attention":
-            # Empile les domaines comme une séquence pour le transformer
-            # (B, N_domains, workspace_dim) — chaque domaine = un "token"
-            stacked = torch.stack(list(workspace_reprs.values()), dim=1)
-            fused = self.fusion_net(stacked)  # (B, N_domains, D)
-            # Mean pool sur les domaines après attention
-            return fused.mean(dim=1)  # (B, D)
+        stacked = torch.stack(list(workspace_reprs.values()), dim=0)  # (N, B, D)
+        w_mean = stacked.mean(dim=0)  # (B, D)
+        return torch.tanh(w_mean)
 
     def translate(
         self,
@@ -126,7 +98,7 @@ class GlobalWorkspace(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Forward complet :
         1. Encode chaque domaine → workspace
-        2. Fusionne
+        2. Fusionne (weighted sum + Tanh)
         3. Broadcast : décode vers tous les domaines
 
         Returns:

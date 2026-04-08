@@ -23,9 +23,9 @@ from models.decoders import VisionDecoder, TextDecoder
 from models.domain_module import DomainModule
 from models.workspace import GlobalWorkspace
 from data.dataset import get_dataset
-from data.tokenizer import SimpleTokenizer
 from pipeline.train import train, train_pretrain, train_align
 from pipeline.eval import evaluate
+from pipeline.diagnostics import build_fixed_val_subset
 
 
 def load_config(path: str) -> dict:
@@ -59,25 +59,17 @@ def build_domain_modules(config: dict) -> dict:
         proj_dropout=cfg_proj["dropout"],
     )
 
-    # --- Text (COCO Captions) ---
+    # --- Text (embeddings E5-large-v2 pré-extraits) ---
     cfg_t = config["text"]
     modules["text"] = DomainModule(
         name="text",
         encoder=TextEncoder(
-            vocab_size=cfg_t["vocab_size"],
-            embed_dim=cfg_t["embed_dim"],
+            feature_dim=cfg_t["feature_dim"],
             latent_dim=config["latent_dims"]["text"],
-            max_seq_len=cfg_t["max_seq_len"],
-            num_heads=cfg_t["num_heads"],
-            num_layers=cfg_t["num_layers"],
         ),
         decoder=TextDecoder(
             latent_dim=config["latent_dims"]["text"],
-            embed_dim=cfg_t["embed_dim"],
-            vocab_size=cfg_t["vocab_size"],
-            max_seq_len=cfg_t["max_seq_len"],
-            num_heads=cfg_t["num_heads"],
-            num_layers=cfg_t["num_layers"],
+            feature_dim=cfg_t["feature_dim"],
         ),
         latent_dim=config["latent_dims"]["text"],
         workspace_dim=ws_dim,
@@ -148,14 +140,20 @@ def main():
         num_workers=config["data"]["num_workers"],
     )
 
+    # --- Diagnostics val subset (fixe, 1000 paires) ---
+    diag_subset = build_fixed_val_subset(val_dataset, num_samples=1000)
+    diag_loader = DataLoader(
+        diag_subset,
+        batch_size=config["training"]["batch_size"],
+        shuffle=False,
+        num_workers=config["data"]["num_workers"],
+    )
+
     # --- Modèle ---
     domain_modules = build_domain_modules(config)
     workspace = GlobalWorkspace(
         domain_modules=domain_modules,
         workspace_dim=config["workspace_dim"],
-        fusion=config["workspace"]["fusion"],
-        num_heads=config["workspace"]["num_heads"],
-        num_layers=config["workspace"]["num_layers"],
     ).to(device)
 
     # Compte les params
@@ -168,24 +166,33 @@ def main():
     # --- Train ---
     if args.resume_pretrain:
         print(f"Loading pretrain checkpoint: {args.resume_pretrain}")
-        workspace.load_state_dict(torch.load(args.resume_pretrain, map_location=device))
+        checkpoint = torch.load(args.resume_pretrain, map_location=device)
+        # Chargement partiel : si l'archi des projections/workspace a changé,
+        # on ne charge que les poids dont la shape correspond.
+        model_state = workspace.state_dict()
+        loaded, skipped = 0, 0
+        for k, v in checkpoint.items():
+            if k in model_state and model_state[k].shape == v.shape:
+                model_state[k] = v
+                loaded += 1
+            else:
+                skipped += 1
+        workspace.load_state_dict(model_state)
+        print(f"  Chargés: {loaded} tenseurs, Skippés (shape mismatch): {skipped} tenseurs")
 
     if args.phase == "pretrain":
         train_pretrain(workspace, train_loader, config, device, run_dir=run_dir)
     elif args.phase == "align":
         if not args.resume_pretrain:
             print("WARNING: --phase align sans --resume_pretrain, les autoencoders ne sont pas pretrained!")
-        train_align(workspace, train_loader, config, device, run_dir=run_dir)
+        train_align(workspace, train_loader, config, device, run_dir=run_dir, val_loader=diag_loader)
     else:  # both
         if args.resume_pretrain:
             config["training"]["pretrain_epochs"] = 0
-        train(workspace, train_loader, config, device, run_dir=run_dir)
+        train(workspace, train_loader, config, device, run_dir=run_dir, val_loader=diag_loader)
 
     # --- Eval ---
-    tokenizer = SimpleTokenizer.load(
-        f"{config['data']['data_root']}/vocab.json"
-    )
-    results = evaluate(workspace, val_loader, config, device, tokenizer)
+    results = evaluate(workspace, val_loader, config, device, val_dataset=val_dataset)
 
     # --- Save ---
     save_path = os.path.join(run_dir, "checkpoint.pt")

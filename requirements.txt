@@ -9,3 +9,4 @@ Pillow
 h5py
 scikit-learn
 matplotlib
+sentence-transformers
