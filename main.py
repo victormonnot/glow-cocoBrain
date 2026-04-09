@@ -18,8 +18,8 @@ import yaml
 import torch
 from torch.utils.data import DataLoader
 
-from models.encoders import VisionEncoder, TextEncoder
-from models.decoders import VisionDecoder, TextDecoder
+from models.encoders import VisionEncoder, TextEncoder, BrainEncoder
+from models.decoders import VisionDecoder, TextDecoder, BrainDecoder
 from models.domain_module import DomainModule
 from models.workspace import GlobalWorkspace
 from data.dataset import get_dataset
@@ -77,6 +77,26 @@ def build_domain_modules(config: dict) -> dict:
         proj_num_layers=cfg_proj["num_layers"],
         proj_dropout=cfg_proj["dropout"],
     )
+
+    # --- Brain (betas fMRI PCA-réduits, optionnel) ---
+    if "brain" in config.get("latent_dims", {}):
+        cfg_b = config["brain"]
+        modules["brain"] = DomainModule(
+            name="brain",
+            encoder=BrainEncoder(
+                feature_dim=cfg_b["feature_dim"],
+                latent_dim=config["latent_dims"]["brain"],
+            ),
+            decoder=BrainDecoder(
+                latent_dim=config["latent_dims"]["brain"],
+                feature_dim=cfg_b["feature_dim"],
+            ),
+            latent_dim=config["latent_dims"]["brain"],
+            workspace_dim=ws_dim,
+            proj_hidden_dim=cfg_proj["hidden_dim"],
+            proj_num_layers=cfg_proj["num_layers"],
+            proj_dropout=cfg_proj["dropout"],
+        )
 
     return modules
 
@@ -166,19 +186,24 @@ def main():
     # --- Train ---
     if args.resume_pretrain:
         print(f"Loading pretrain checkpoint: {args.resume_pretrain}")
-        checkpoint = torch.load(args.resume_pretrain, map_location=device)
-        # Chargement partiel : si l'archi des projections/workspace a changé,
-        # on ne charge que les poids dont la shape correspond.
+        checkpoint = torch.load(args.resume_pretrain, map_location=device, weights_only=False)
+        # Support both formats: dict with model_state_dict key, or raw state_dict
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+        # Chargement partiel : si l'archi a changé ou si on ajoute un nouveau
+        # domaine (ex: brain), on ne charge que les poids dont la shape correspond.
         model_state = workspace.state_dict()
         loaded, skipped = 0, 0
-        for k, v in checkpoint.items():
+        for k, v in state_dict.items():
             if k in model_state and model_state[k].shape == v.shape:
                 model_state[k] = v
                 loaded += 1
             else:
                 skipped += 1
         workspace.load_state_dict(model_state)
-        print(f"  Chargés: {loaded} tenseurs, Skippés (shape mismatch): {skipped} tenseurs")
+        print(f"  Chargés: {loaded} tenseurs, Skippés (shape mismatch ou nouveau domaine): {skipped} tenseurs")
 
     if args.phase == "pretrain":
         train_pretrain(workspace, train_loader, config, device, run_dir=run_dir)
@@ -187,8 +212,8 @@ def main():
             print("WARNING: --phase align sans --resume_pretrain, les autoencoders ne sont pas pretrained!")
         train_align(workspace, train_loader, config, device, run_dir=run_dir, val_loader=diag_loader)
     else:  # both
-        if args.resume_pretrain:
-            config["training"]["pretrain_epochs"] = 0
+        # Don't skip pretrain when new domains exist (e.g. brain from checkpoint
+        # that only has vision+text). Frozen domains won't train anyway.
         train(workspace, train_loader, config, device, run_dir=run_dir, val_loader=diag_loader)
 
     # --- Eval ---

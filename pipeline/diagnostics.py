@@ -67,9 +67,10 @@ def compute_diagnostics(
         contrastive_fn = ContrastiveLoss(temperature=0.07)
 
     # Collect all workspace representations, latents, and raw inputs
-    all_w = {"vision": [], "text": []}
-    all_z = {"vision": [], "text": []}
-    all_x = {"vision": [], "text": []}
+    domain_names = list(workspace.domain_modules.keys())
+    all_w = {name: [] for name in domain_names}
+    all_z = {name: [] for name in domain_names}
+    all_x = {name: [] for name in domain_names}
 
     for batch in val_loader:
         inputs = {
@@ -110,92 +111,122 @@ def compute_diagnostics(
         w_centered = w - w.mean(dim=0, keepdim=True)
         metrics[f"effective_rank_{name}"] = _effective_rank(w_centered)
 
-    # Centroid cosine similarity
-    centroid_vis = all_w["vision"].mean(dim=0)
-    centroid_text = all_w["text"].mean(dim=0)
-    metrics["centroid_cos"] = F.cosine_similarity(
-        centroid_vis.unsqueeze(0), centroid_text.unsqueeze(0)
-    ).item()
+    # Centroid cosine similarity — for all domain pairs
+    centroids = {name: all_w[name].mean(dim=0) for name in domain_names}
+    for i in range(len(domain_names)):
+        for j in range(i + 1, len(domain_names)):
+            n_i, n_j = domain_names[i], domain_names[j]
+            cos = F.cosine_similarity(
+                centroids[n_i].unsqueeze(0), centroids[n_j].unsqueeze(0)
+            ).item()
+            metrics[f"centroid_cos_{n_i}_{n_j}"] = cos
+    # Backward compat: "centroid_cos" = first pair
+    if len(domain_names) >= 2:
+        metrics["centroid_cos"] = metrics[f"centroid_cos_{domain_names[0]}_{domain_names[1]}"]
 
-    # Pairwise cosine: positives (matched pairs) and negatives
-    w_vis_norm = F.normalize(all_w["vision"], dim=-1)
-    w_text_norm = F.normalize(all_w["text"], dim=-1)
+    # Pairwise cosine: positives and negatives — for first two domains
+    # (same-index pairs are positives, off-diagonal are negatives)
+    d0, d1 = domain_names[0], domain_names[1]
+    w_d0_norm = F.normalize(all_w[d0], dim=-1)
+    w_d1_norm = F.normalize(all_w[d1], dim=-1)
 
-    # Positives: diagonal of similarity matrix
-    cos_pos = (w_vis_norm * w_text_norm).sum(dim=-1)  # (N,)
+    cos_pos = (w_d0_norm * w_d1_norm).sum(dim=-1)
     metrics["pairwise_cos_pos"] = cos_pos.mean().item()
 
-    # Negatives: off-diagonal mean (sample for efficiency)
-    N = w_vis_norm.size(0)
-    sim_matrix = torch.matmul(w_vis_norm, w_text_norm.T)  # (N, N)
-    # Mask out diagonal
+    N = w_d0_norm.size(0)
+    sim_matrix = torch.matmul(w_d0_norm, w_d1_norm.T)
     mask = ~torch.eye(N, device=device, dtype=torch.bool)
     metrics["pairwise_cos_neg"] = sim_matrix[mask].mean().item()
 
-    # Gap between pos and neg (higher = better discrimination)
     metrics["cos_gap"] = metrics["pairwise_cos_pos"] - metrics["pairwise_cos_neg"]
 
     # ================================================================
     # LOSSES (decomposed)
     # ================================================================
 
-    w_vis = all_w["vision"]
-    w_text = all_w["text"]
-    z_vis = all_z["vision"]
-    z_text = all_z["text"]
+    # Compute losses for all domain pairs
+    for i in range(len(domain_names)):
+        for j in range(i + 1, len(domain_names)):
+            n_a, n_b = domain_names[i], domain_names[j]
+            w_a, w_b = all_w[n_a], all_w[n_b]
+            z_a, z_b = all_z[n_a], all_z[n_b]
+            mod_a = workspace.domain_modules[n_a]
+            mod_b = workspace.domain_modules[n_b]
 
-    mod_vis = workspace.domain_modules["vision"]
-    mod_text = workspace.domain_modules["text"]
+            # Contrastive (Lcont)
+            metrics[f"loss_contrastive_{n_a}_{n_b}"] = contrastive_fn(w_a, w_b).item()
 
-    # Contrastive (Lcont)
-    metrics["loss_contrastive"] = contrastive_fn(w_vis, w_text).item()
+            # Demi-cycle (Ldcy)
+            z_b_hat = mod_b.from_workspace(w_a)
+            metrics[f"loss_demi_cycle_{n_a}2{n_b}"] = F.mse_loss(z_b_hat, z_b).item()
+            z_a_hat = mod_a.from_workspace(w_b)
+            metrics[f"loss_demi_cycle_{n_b}2{n_a}"] = F.mse_loss(z_a_hat, z_a).item()
 
-    # Demi-cycle (Ldcy) — on latents
-    z_text_hat = mod_text.from_workspace(w_vis)
-    metrics["loss_demi_cycle_v2t"] = F.mse_loss(z_text_hat, z_text).item()
+            # Translation (Ltr) — through decoder
+            x_a_hat = mod_a.decode(z_a_hat)
+            metrics[f"loss_translation_{n_b}2{n_a}"] = F.mse_loss(x_a_hat, all_x[n_a]).item()
+            x_b_hat = mod_b.decode(z_b_hat)
+            metrics[f"loss_translation_{n_a}2{n_b}"] = F.mse_loss(x_b_hat, all_x[n_b]).item()
 
-    z_vis_hat = mod_vis.from_workspace(w_text)
-    metrics["loss_demi_cycle_t2v"] = F.mse_loss(z_vis_hat, z_vis).item()
+            # Cycle (Lcy)
+            z_a_cycle = compute_cycle(mod_a, mod_b, z_a)
+            z_b_cycle = compute_cycle(mod_b, mod_a, z_b)
+            metrics[f"loss_cycle_{n_a}_{n_b}"] = (
+                F.mse_loss(z_a_cycle, z_a).item()
+                + F.mse_loss(z_b_cycle, z_b).item()
+            ) / 2
 
-    # Translation (Ltr) — through decoder (observation space), MSE for both
-    x_vis_hat = mod_vis.decode(z_vis_hat)
-    metrics["loss_translation_t2v"] = F.mse_loss(x_vis_hat, all_x["vision"]).item()
+            # Fusion (Lfusion) — stress test at alpha=0.5 with Tanh
+            w_fused_half = torch.tanh(0.5 * w_a + 0.5 * w_b)
+            z_a_from_fused = mod_a.from_workspace(w_fused_half)
+            z_b_from_fused = mod_b.from_workspace(w_fused_half)
+            metrics[f"loss_fusion_{n_a}"] = F.mse_loss(z_a_from_fused, z_a).item()
+            metrics[f"loss_fusion_{n_b}"] = F.mse_loss(z_b_from_fused, z_b).item()
+            metrics[f"loss_fusion_{n_a}_{n_b}"] = (
+                metrics[f"loss_fusion_{n_a}"] + metrics[f"loss_fusion_{n_b}"]
+            ) / 2
 
-    x_text_hat = mod_text.decode(z_text_hat)
-    metrics["loss_translation_v2t"] = F.mse_loss(x_text_hat, all_x["text"]).item()
-
-    # Cycle (Lcy)
-    z_vis_cycle = compute_cycle(mod_vis, mod_text, z_vis)
-    z_text_cycle = compute_cycle(mod_text, mod_vis, z_text)
-    metrics["loss_cycle"] = (
-        F.mse_loss(z_vis_cycle, z_vis).item()
-        + F.mse_loss(z_text_cycle, z_text).item()
-    ) / 2
-
-    # Fusion (Lfusion) — stress test at alpha=0.5 with Tanh
-    w_fused_half = torch.tanh(0.5 * w_vis + 0.5 * w_text)
-    z_vis_from_fused = mod_vis.from_workspace(w_fused_half)
-    z_text_from_fused = mod_text.from_workspace(w_fused_half)
-    metrics["loss_fusion_vis"] = F.mse_loss(z_vis_from_fused, z_vis).item()
-    metrics["loss_fusion_text"] = F.mse_loss(z_text_from_fused, z_text).item()
-    metrics["loss_fusion_total"] = (metrics["loss_fusion_vis"] + metrics["loss_fusion_text"]) / 2
+    # Backward compat aliases for 2-domain case (vision+text)
+    if "vision" in domain_names and "text" in domain_names:
+        metrics.setdefault("loss_contrastive", metrics.get("loss_contrastive_vision_text", 0.0))
+        metrics.setdefault("loss_demi_cycle_v2t", metrics.get("loss_demi_cycle_vision2text", 0.0))
+        metrics.setdefault("loss_demi_cycle_t2v", metrics.get("loss_demi_cycle_text2vision", 0.0))
+        metrics.setdefault("loss_translation_v2t", metrics.get("loss_translation_vision2text", 0.0))
+        metrics.setdefault("loss_translation_t2v", metrics.get("loss_translation_text2vision", 0.0))
+        metrics.setdefault("loss_cycle", metrics.get("loss_cycle_vision_text", 0.0))
+        metrics.setdefault("loss_fusion_vis", metrics.get("loss_fusion_vision", 0.0))
+        metrics.setdefault("loss_fusion_text", metrics.get("loss_fusion_text", 0.0))
+        metrics.setdefault("loss_fusion_total", metrics.get("loss_fusion_vision_text", 0.0))
 
     # ================================================================
     # RETRIEVAL (on this val subset)
     # ================================================================
 
-    # Image -> Text
-    sim = torch.matmul(w_vis_norm, w_text_norm.T)  # already computed
+    # Retrieval for all domain pairs
     gt = torch.arange(N, device=device)
+    for i in range(len(domain_names)):
+        for j in range(i + 1, len(domain_names)):
+            n_a, n_b = domain_names[i], domain_names[j]
+            w_a_n = F.normalize(all_w[n_a], dim=-1)
+            w_b_n = F.normalize(all_w[n_b], dim=-1)
+            sim = torch.matmul(w_a_n, w_b_n.T)
 
-    _, topk_i2t = sim.topk(5, dim=1)
-    metrics["retrieval_i2t_R@1"] = (topk_i2t[:, :1] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
-    metrics["retrieval_i2t_R@5"] = (topk_i2t[:, :5] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
+            # a -> b
+            _, topk_a2b = sim.topk(5, dim=1)
+            metrics[f"retrieval_{n_a}2{n_b}_R@1"] = (topk_a2b[:, :1] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
+            metrics[f"retrieval_{n_a}2{n_b}_R@5"] = (topk_a2b[:, :5] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
 
-    # Text -> Image
-    _, topk_t2i = sim.T.topk(5, dim=1)
-    metrics["retrieval_t2i_R@1"] = (topk_t2i[:, :1] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
-    metrics["retrieval_t2i_R@5"] = (topk_t2i[:, :5] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
+            # b -> a
+            _, topk_b2a = sim.T.topk(5, dim=1)
+            metrics[f"retrieval_{n_b}2{n_a}_R@1"] = (topk_b2a[:, :1] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
+            metrics[f"retrieval_{n_b}2{n_a}_R@5"] = (topk_b2a[:, :5] == gt.unsqueeze(1)).any(dim=1).float().mean().item()
+
+    # Backward compat aliases
+    if "vision" in domain_names and "text" in domain_names:
+        metrics.setdefault("retrieval_i2t_R@1", metrics.get("retrieval_vision2text_R@1", 0.0))
+        metrics.setdefault("retrieval_i2t_R@5", metrics.get("retrieval_vision2text_R@5", 0.0))
+        metrics.setdefault("retrieval_t2i_R@1", metrics.get("retrieval_text2vision_R@1", 0.0))
+        metrics.setdefault("retrieval_t2i_R@5", metrics.get("retrieval_text2vision_R@5", 0.0))
 
     workspace.train()
     return metrics

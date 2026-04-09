@@ -1051,3 +1051,147 @@ Tout le reste est identique (batch 1024, 50 epochs align, LayerNorm projections)
 ### Bilan global (Run 13 → 16)
 
 Le GW vision+texte est prêt pour l'ajout du module cerveau (NSD). Workspace compact (32 dims, 82% utilisé), bon alignement inter-modal, architecture conforme aux papiers du lab.
+
+---
+
+## 9 avril 2026 — Phase 3 : Module cerveau (NSD fMRI)
+
+### Objectif
+
+Ajouter un 3ème DomainModule (brain) qui encode/décode les betas fMRI de NSD (Natural Scenes Dataset), permettant le brain decoding (fMRI → image/texte) et le brain encoding (image/texte → fMRI). C'est le cœur du projet et de la candidature au stage.
+
+### Stratégie
+
+- **Freeze vision+text** (Run 16 déjà aligné), entraîner seulement le module brain
+- **Dataset NSD** : Subject 1, ~10k images COCO vues en fMRI, ROI nsdgeneral (cortex visuel ventral)
+- **Domain pairs** : [vision, brain] + [text, brain] uniquement (pas [vision, text] — déjà aligné)
+- **Betas** : PCA 1024 composantes → z-score normalisé → BrainEncoder → z_brain → projection → workspace
+
+### Nouveaux fichiers créés
+
+| Fichier | Rôle |
+|---|---|
+| `scripts/download_nsd.sh` | Télécharge NSD Subject 1 depuis AWS S3 (~20 GB : 40 sessions betas + metadata + ROI mask) |
+| `scripts/extract_brain_features.py` | Extraction pipeline : ROI masking → trial mapping → beta averaging (~3 reps/image) → PCA(1024) → z-score → .npy |
+| `data/nsd_dataset.py` | `NSDDataset` : charge les 3 modalités (vision+text depuis data/coco, brain depuis data/nsd) pour les ~10k images NSD |
+| `config/config_brain.yaml` | Config Phase 3 : frozen_domains, domain_pairs brain, etc. |
+
+### Fichiers modifiés
+
+| Fichier | Modification |
+|---|---|
+| `models/encoders.py` | Ajouté `BrainEncoder` |
+| `models/decoders.py` | Ajouté `BrainDecoder` |
+| `data/dataset.py` | Ajouté case `"nsd"` dans `get_dataset()` |
+| `main.py` | Bloc conditionnel brain dans `build_domain_modules()`, chargement partiel checkpoint (2→3 domaines) |
+| `pipeline/train.py` | `_freeze_domains()`, support `frozen_domains` dans pretrain+align, affichage métriques brain |
+| `pipeline/diagnostics.py` | Généralisé de 2 domaines hardcodés à N domaines dynamiques (boucle sur toutes les paires) |
+
+### Bugs rencontrés et corrigés
+
+#### Bug 1 — NSD S3 path 404
+
+Les betas NSD sont sous `nsddata_betas/` (bucket séparé), pas `nsddata/`. Le script de téléchargement pointait vers le mauvais chemin.
+
+**Fix :** Corrigé le path dans `download_nsd.sh` et `extract_brain_features.py`.
+
+#### Bug 2 — Downloads silencieusement vides
+
+wget échouait silencieusement sur les gros fichiers (~500 MB), produisant des fichiers de 0 bytes.
+
+**Fix :** Ajouté `--continue --tries=5 --timeout=60 --waitretry=10`, vérification post-download `[ ! -s "$local_path" ]`, nettoyage des fichiers vides avant retry.
+
+#### Bug 3 — IndexError dans extract_brain_features.py
+
+`n_trials_subj1` calculé comme `subjectim[0].max()` = 73000 (max image ID dans le pool NSD global) au lieu de `len(masterordering)` = 30000 (nombre réel de trials pour Subject 1). Causait un out-of-bounds lors de l'itération.
+
+**Fix :** `n_trials_subj1 = len(masterordering)`.
+
+### Run 15 — Premier essai (cassé)
+
+**Problèmes multiples :**
+
+1. **Brain features pas normalisées** — les betas après PCA avaient des magnitudes ~100-1000x plus grandes que vision (ResNet, normalisé) et text (E5, normalisé). La translation loss MSE explosait à ~3.86 million.
+
+2. **Pretrain brain skippé** — `main.py` avec `--phase both --resume_pretrain` forçait `pretrain_epochs=0`, ce qui sautait entièrement le pretrain du brain autoencoder. Le brain encoder restait avec des poids random.
+
+3. **Brain encoder/decoder frozen pendant align** — `_freeze_encoders_decoders()` gelait **tous** les encoders/decoders y compris brain. Seules les brain projections étaient trainables, mais elles recevaient des latents random (encoder frozen) → les projections essayaient d'aligner du bruit.
+
+4. **Affichage des mauvaises métriques** — le print pendant le training affichait `centroid_cos` et `R@1` des paires vision↔text (frozen, constantes) au lieu des métriques brain.
+
+| Métrique | Valeur |
+|---|---|
+| translation loss | 3,860,000 (constant) |
+| translation_mse (eval) | 1,859,890,686 |
+| centroid_cos vision↔brain | -0.20 |
+| retrieval brain R@1 | 0% |
+| Karpathy (frozen, intact) | 82.3% i2t R@1 |
+
+### Corrections appliquées
+
+| Problème | Fix |
+|---|---|
+| Features pas normalisées | Ajouté z-score normalisation dans `extract_brain_features.py` (fit sur train, apply sur val). Sauvegarde `zscore_mean.npy` + `zscore_std.npy` pour dé-normalisation future |
+| Pretrain skippé | Supprimé le `config["training"]["pretrain_epochs"] = 0` dans `main.py` quand `--resume_pretrain` est fourni. Les frozen domains ne s'entraînent pas de toute façon |
+| Brain frozen pendant align | Après `_freeze_encoders_decoders()` + `_freeze_domains()`, unfreeze explicitement encoder/decoder des domaines non-frozen (brain end-to-end) |
+| Mauvaises métriques affichées | Conditionnel : si brain exists, afficher `centr_vb`, `centr_tb`, `R@1_v2b`, `R@1_b2v`, `R@1_t2b`, `R@1_b2t` |
+
+### Run 16 — Z-score + pretrain + unfrozen brain
+
+Première run fonctionnelle. Géométrie corrigée, mais retrieval toujours ~0%.
+
+| Métrique | Run 15 (cassé) | Run 16 (fixé) |
+|---|---|---|
+| translation loss (train) | 3,860,000 | **1.99** |
+| translation_mse (eval) | 1.86 milliard | **820** |
+| centroid_cos vision↔brain | -0.20 | **+0.44** |
+| centroid_cos text↔brain | -0.23 | **+0.52** |
+| centroid_dist vision↔brain | 7.03 | **0.40** |
+| brain effective_rank | ? | **26.1** (=vision) |
+| brain mean_norm | 7.97 | **6.83** (~vision 6.24) |
+| retrieval brain R@1 | 0% | **~0.1%** (≈random) |
+| Karpathy (frozen) | 82.3% | **82.3%** |
+
+**Analyse :** la géométrie est saine (centroids alignés, norms comparables, effective_rank OK), mais le contrastif brain ne discrimine pas (loss_contrastive_vision_brain ~9.28, quasi log(1000)). Le brain autoencoder recon_loss = 0.85 à epoch 20 (baseline = 1.0 pour z-scored) → ne capture que ~15% de la variance.
+
+**Config :** pretrain_epochs=20, align_epochs=50, align_lr=5e-4.
+
+### Run 17 — Plus d'epochs, LR réduit
+
+Augmenté pretrain à 100 epochs, align à 200, LR align 5e-4 → 1e-4.
+
+| Métrique | Run 16 | Run 17 |
+|---|---|---|
+| pretrain recon_loss (final) | 0.85 (ep 20) | **0.76** (ep 100) |
+| contrastive train (final) | 4.18 (ep 50) | **3.89** (ep 200) |
+| translation train (final) | 1.99 | **1.99** (inchangé) |
+| centroid_cos vision↔brain | 0.44 | **0.55** |
+| centroid_cos text↔brain | 0.52 | **0.54** |
+| centroid_dist vision↔brain | 0.40 | **0.28** |
+| retrieval brain R@1 | ~0.1% | **~0.1%** (toujours random) |
+
+**Diagnostic :** plus d'epochs = meilleure géométrie mais retrieval toujours à 0. Le problème fondamental : le brain autoencoder recon_loss à 0.76 (baseline 1.0 pour z-scored) ne capture que **24% de la variance**. Le bottleneck 1024→512→**64** perd l'information discriminative des betas fMRI bruitées.
+
+**Pourquoi 64-dim marche pour vision/text mais pas pour brain :**
+- Vision (ResNet-50 features) : hyper-structurées, pré-entraînées ImageNet, compresser 2048→64 perd peu d'info utile
+- Text (E5 embeddings) : pré-entraîné sur du texte massif, 1024→64 préserve la sémantique
+- Brain (PCA betas fMRI) : signal bruité, faible SNR, l'info discriminative est diluée sur 1024 dims → compresser à 64 la détruit
+
+### Run 18 (en cours) — Latent brain 256 + encoder 3 couches
+
+**Changement clé :** augmenter le bottleneck brain pour préserver plus de signal.
+
+| | Avant (Runs 16-17) | Après (Run 18) |
+|---|---|---|
+| brain latent_dim | 64 | **256** |
+| BrainEncoder | 1024→512→64 (2 layers) | **1024→768→512→256 (3 layers)** |
+| BrainDecoder | 64→512→1024 (2 layers) | **256→512→768→1024 (3 layers)** |
+| projection | 64→32 workspace | **256→32 workspace** |
+
+**Raisonnement :** la projection (256→32) fait la compression vers le workspace partagé. Le brain autoencoder a maintenant 4x plus de dimensions latentes pour capturer le signal discriminatif des betas fMRI. La recon_loss devrait descendre nettement en dessous de 0.76.
+
+**Critère de succès :** recon_loss pretrain < 0.5, et retrieval brain R@1 > random (> 1% sur 1K val).
+
+### Bilan Phase 3 (Runs 15-18)
+
+Le pipeline est fonctionnel end-to-end : download NSD → extraction + PCA + z-score → NSDDataset 3 modalités → freeze vision+text → train brain module → eval cross-modal. Les bugs infra sont corrigés. Le prochain levier est la capacité du brain autoencoder à préserver l'information discriminative à travers le bottleneck.

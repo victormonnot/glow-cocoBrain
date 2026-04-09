@@ -1,10 +1,11 @@
 """
 decoders.py — Décodeurs domaine-spécifiques
 =============================================
-VisionDecoder : z_vision (128) → features ResNet-50 reconstruites (2048)
-TextDecoder   : z_text (128) → embeddings E5 reconstruits (1024)
+VisionDecoder : z_vision (64) → features ResNet-50 reconstruites (2048)
+TextDecoder   : z_text (64) → embeddings E5 reconstruits (1024)
+BrainDecoder  : z_brain (64) → betas fMRI PCA reconstruits (1024)
 
-Les deux décodeurs utilisent MSE comme loss de reconstruction.
+Tous les décodeurs utilisent MSE comme loss de reconstruction.
 """
 
 import torch
@@ -53,4 +54,28 @@ class TextDecoder(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         """z: (B, latent_dim) → e5_hat: (B, 1024)"""
+        return self.net(z)
+
+
+class BrainDecoder(nn.Module):
+    """z_brain → PCA-reduced fMRI betas reconstruits.
+
+    MLP miroir 3 couches : latent_dim → 512 → 768 → 1024.
+    Loss Phase 1 : MSE(betas_hat, betas_original).
+    """
+
+    def __init__(self, latent_dim: int = 256, feature_dim: int = 1024):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(latent_dim, 512),
+            nn.LayerNorm(512),
+            nn.GELU(),
+            nn.Linear(512, 768),
+            nn.LayerNorm(768),
+            nn.GELU(),
+            nn.Linear(768, feature_dim),
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: (B, latent_dim) → betas_hat: (B, 1024)"""
         return self.net(z)

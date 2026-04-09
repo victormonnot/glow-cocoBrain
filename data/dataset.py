@@ -134,7 +134,15 @@ def get_dataset(config: dict, split: str = "train") -> Dataset:
             split=split,
             paired_fraction=config["training"].get("paired_fraction", 1.0),
         )
+    elif name == "nsd":
+        from data.nsd_dataset import NSDDataset
+        return NSDDataset(
+            coco_root=config["data"]["data_root"],
+            nsd_root=config["data"]["nsd_root"],
+            split=split,
+            paired_fraction=config["training"].get("paired_fraction", 1.0),
+        )
     else:
         raise ValueError(
-            f"Dataset '{name}' pas implémenté. Utilise 'dummy' ou 'coco'."
+            f"Dataset '{name}' pas implémenté. Utilise 'dummy', 'coco' ou 'nsd'."
         )

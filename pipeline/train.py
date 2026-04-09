@@ -31,6 +31,18 @@ from losses.cycle import CycleConsistencyLoss, compute_cycle
 from pipeline.diagnostics import compute_diagnostics, DiagnosticsLogger
 
 
+def _freeze_domains(workspace: GlobalWorkspace, domain_names: list):
+    """Gèle entièrement les domaines spécifiés (encoder + decoder + projections).
+
+    Utilisé pour Phase 3 : freeze vision+text, entraîner seulement brain.
+    """
+    for name in domain_names:
+        if name in workspace.domain_modules:
+            for p in workspace.domain_modules[name].parameters():
+                p.requires_grad = False
+            print(f"    Frozen domain: {name}")
+
+
 def _freeze_projections(workspace: GlobalWorkspace):
     """Gèle les projections pour Phase 1."""
     for module in workspace.domain_modules.values():
@@ -261,6 +273,11 @@ def train_pretrain(
 
     _freeze_projections(workspace)
 
+    # Freeze entire domains if configured (e.g. vision+text for Phase 3)
+    frozen_domains = tc.get("frozen_domains", [])
+    if frozen_domains:
+        _freeze_domains(workspace, frozen_domains)
+
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, workspace.parameters()),
         lr=tc["pretrain_lr"],
@@ -297,13 +314,27 @@ def train_align(
     print("PHASE 2 — Workspace alignment")
     print("=" * 60)
 
-    # Freeze encodeurs/décodeurs, unfreeze projections
+    # Freeze encodeurs/décodeurs, unfreeze projections (standard Phase 2)
     _freeze_encoders_decoders(workspace)
     _unfreeze_projections(workspace)
 
+    # Freeze entire domains if configured (e.g. vision+text for Phase 3)
+    frozen_domains = tc.get("frozen_domains", [])
+    if frozen_domains:
+        _freeze_domains(workspace, frozen_domains)
+        # Unfreeze encoder/decoder for non-frozen domains — they need
+        # end-to-end training (e.g. brain encoder was just pretrained)
+        for name, mod in workspace.domain_modules.items():
+            if name not in frozen_domains:
+                for p in mod.encoder.parameters():
+                    p.requires_grad = True
+                for p in mod.decoder.parameters():
+                    p.requires_grad = True
+                print(f"    Unfrozen encoder+decoder: {name}")
+
     trainable = sum(p.numel() for p in workspace.parameters() if p.requires_grad)
     total = sum(p.numel() for p in workspace.parameters())
-    print(f"  Params trainables: {trainable:,} / {total:,} (encodeurs/decodeurs frozen)")
+    print(f"  Params trainables: {trainable:,} / {total:,}")
 
     contrastive_fn = ContrastiveLoss(temperature=lc["contrastive"]["temperature"])
     cycle_fn = CycleConsistencyLoss()
@@ -360,11 +391,22 @@ def train_align(
         if diag_logger is not None:
             diag = compute_diagnostics(workspace, val_loader, device, contrastive_fn)
             diag_logger.log(epoch + 1, diag)
-            diag_str = (
-                f"  val: cos_gap={diag['cos_gap']:.3f} "
-                f"centr={diag['centroid_cos']:.3f} "
-                f"R@1={diag['retrieval_i2t_R@1']:.3f}"
-            )
+            # Show brain metrics if brain domain exists, otherwise vision↔text
+            if "brain" in workspace.domain_modules:
+                diag_str = (
+                    f"  val: centr_vb={diag.get('centroid_cos_vision_brain', 0):.3f} "
+                    f"centr_tb={diag.get('centroid_cos_text_brain', 0):.3f} "
+                    f"R@1_v2b={diag.get('retrieval_vision2brain_R@1', 0):.3f} "
+                    f"R@1_b2v={diag.get('retrieval_brain2vision_R@1', 0):.3f} "
+                    f"R@1_t2b={diag.get('retrieval_text2brain_R@1', 0):.3f} "
+                    f"R@1_b2t={diag.get('retrieval_brain2text_R@1', 0):.3f}"
+                )
+            else:
+                diag_str = (
+                    f"  val: cos_gap={diag['cos_gap']:.3f} "
+                    f"centr={diag['centroid_cos']:.3f} "
+                    f"R@1={diag['retrieval_i2t_R@1']:.3f}"
+                )
 
         print(
             f"  Epoch {epoch+1:3d}/{tc['align_epochs']} — "

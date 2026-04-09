@@ -1,0 +1,81 @@
+# ============================================================
+# GLoW cocoBrain — Phase 3 : Brain module alignment (NSD)
+# ============================================================
+# Charge les poids vision+text de Run 16 (frozen), entraîne
+# uniquement le module brain (encoder, decoder, projections).
+
+seed: 42
+
+# --- Dimensions ---
+workspace_dim: 32
+latent_dims:
+  vision: 64
+  text: 64
+  brain: 256              # Plus large que vision/text — fMRI bruitée a besoin de plus de capacité
+
+# --- Vision : features ResNet-50 pré-extraites ---
+vision:
+  feature_dim: 2048
+
+# --- Text : embeddings E5-large-v2 pré-extraits ---
+text:
+  feature_dim: 1024
+
+# --- Brain : betas fMRI PCA-réduits (NSD Subject 1) ---
+brain:
+  feature_dim: 1024       # Après PCA (raw ~10k voxels → 1024 composantes)
+
+# --- Projections ---
+projection:
+  hidden_dim: 256
+  num_layers: 6
+  dropout: 0.1
+
+# --- Losses ---
+losses:
+  contrastive:
+    temperature: 0.1
+    weight: 0.1
+  translation:
+    weight: 1.0
+  demi_cycle:
+    weight: 1.0
+  cycle:
+    weight: 1.0
+  fusion:
+    weight: 1.0
+
+# --- Training ---
+training:
+  pretrain_epochs: 100    # Brain autoencoder needs more epochs (was still converging at 20)
+  pretrain_lr: 3.0e-4
+
+  align_epochs: 200       # ~10 batches/epoch → need more epochs for convergence
+  align_lr: 1.0e-4        # Lower LR for end-to-end brain training stability
+
+  batch_size: 1024        # ~10k images → ~10 steps/epoch
+  weight_decay: 1.0e-5
+  grad_clip: 1.0
+  paired_fraction: 1.0    # Tout NSD est paired (on a les 3 modalités)
+
+  domain_pairs:
+    - ["vision", "brain"]
+    - ["text", "brain"]
+    # PAS ["vision", "text"] — déjà aligné dans Run 16
+
+  frozen_domains:          # NOUVEAU — freeze ces domaines entièrement
+    - "vision"
+    - "text"
+
+# --- Data ---
+data:
+  dataset: "nsd"
+  data_root: "data/coco"
+  nsd_root: "data/nsd"
+  num_workers: 4
+
+# --- Logging ---
+logging:
+  use_wandb: true
+  project: "glow-cocoBrain"
+  log_every: 50
