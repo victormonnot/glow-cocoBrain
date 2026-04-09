@@ -6,10 +6,10 @@
 seed: 42
 
 # --- Dimensions ---
-workspace_dim: 64         # <- était 384 (le lab utilise 10-60)
+workspace_dim: 32         # <- était 64 (effective rank ~37/64, on compacte)
 latent_dims:
-  vision: 128             # <- était 512
-  text: 128               # <- était 512
+  vision: 64              # <- était 128
+  text: 64                # <- était 128
 
 # --- Vision : features ResNet-50 pré-extraites ---
 vision:
@@ -47,7 +47,7 @@ training:
   align_epochs: 50
   align_lr: 5.0e-4
 
-  batch_size: 512
+  batch_size: 1024
   weight_decay: 1.0e-5
   grad_clip: 1.0
   paired_fraction: 0.2   # 20% des données appariées pour Ltr et Lcont

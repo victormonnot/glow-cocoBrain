@@ -973,4 +973,81 @@ Le modèle plateau vers epoch 40. Les 20 epochs supplémentaires par rapport à 
 
 ### Bilan
 
-L'architecture est saine : normes équilibrées, pas de collapse, bonne discrimination. Le GW vision+texte est prêt pour l'ajout du module cerveau (NSD). La légère baisse de R@1 par rapport à Run 13 est un trade-off acceptable pour une meilleure structure.
+L'architecture est saine : normes équilibrées, pas de collapse, bonne discrimination. La légère baisse de R@1 par rapport à Run 13 est un trade-off acceptable pour une meilleure structure.
+
+---
+
+## 8 avril 2026 — Run 15 : batch size 1024
+
+### Changement
+
+Batch size 512 → 1024. GPU sous-utilisé (10% VRAM, 30-40% GPU utilization), donc on monte. Plus de négatifs par batch pour le contrastif, et le multi-positifs COCO (5 captions/image) a plus de chances de trouver des doublons.
+
+### Résultats : gain sur text→image et effective_rank
+
+| Métrique | Run 14 (b=512) | Run 15 (b=1024) |
+|---|---|---|
+| i2t R@1 (1K diag) | 27.1% | 26.9% |
+| t2i R@1 (1K diag) | 26.1% | **28.5%** |
+| i2t R@5 (1K diag) | 65.8% | 66.0% |
+| t2i R@5 (1K diag) | 63.9% | **67.0%** |
+| effective_rank | 33.6 | **37.1** |
+| ratio norm text/vis | 1.12 | **1.07** |
+| R@1 25K | 2.46% | **2.77%** |
+| Karpathy t2i R@1 | 67.6% | **68.3%** |
+
+Le batch 1024 améliore le text→image (+2.4 pts R@1, +3.1 pts R@5) et l'effective_rank (37.1/64, les dimensions sont mieux utilisées). Le i2t est stable. Gain gratuit — on garde batch 1024.
+
+### Bilan global (Run 13 → 14 → 15)
+
+Le GW vision+texte est stable. On teste ensuite la compaction des dimensions.
+
+---
+
+## 9 avril 2026 — Run 16 : compaction workspace 32 / latent 64
+
+### Motivation
+
+L'effective rank de Run 15 montrait 37.1/64 (58% d'utilisation du workspace). ~27 dimensions sous-utilisées. L'idée : réduire les dimensions pour mieux exploiter l'espace, se rapprocher de la théorie GWT (le workspace est un bottleneck compact), et préparer l'ajout du module fMRI sans workspace surdimensionné.
+
+Le lab utilise 10-60 pour le workspace dans leurs papiers, et shimmer-ssd utilise 12 dims pour 3 modalités.
+
+### Changements
+
+- `workspace_dim` : 64 → **32**
+- `latent_dims` (vision + text) : 128 → **64**
+- Retrain complet (pretrain + align) — les poids ne sont pas compatibles
+
+Tout le reste est identique (batch 1024, 50 epochs align, LayerNorm projections).
+
+### Résultats : workspace mieux exploité, léger coût en R@1
+
+| Métrique | Run 15 (ws=64, lat=128) | Run 16 (ws=32, lat=64) | Delta |
+|---|---|---|---|
+| Karpathy i2t R@1 | 74.2% | 71.0% | -3.2 pts |
+| Karpathy i2t R@5 | 94.4% | 93.4% | -1.0 pts |
+| Karpathy t2i R@1 | 68.3% | 65.4% | -2.9 pts |
+| Karpathy t2i R@5 | 95.8% | 95.3% | -0.5 pts |
+| R@1 25K | 2.77% | 2.39% | -0.4 pts |
+| effective_rank | 37.1/64 (58%) | **26.3/32 (82%)** | +24% utilisation |
+| centroid_cos | 0.33 | **0.42** | +0.09 |
+| centroid_dist | 0.43 | **0.29** | -0.14 |
+| norm vision | 7.73 | 6.24 | — |
+| norm text | 8.24 | 5.10 | — |
+
+### Analyse
+
+**Gains :**
+- **82% du workspace utilisé** (vs 58%) — le bottleneck est maintenant réellement informatif, pas surdimensionné
+- **Meilleur alignement des centroïdes** : centroid_cos +0.09, centroid_dist -0.14 — les modalités sont plus proches dans le workspace
+- **R@5 et R@10 quasi identiques** — la capacité discriminative globale est préservée
+
+**Coûts :**
+- **R@1 Karpathy : -3 pts** — la discrimination fine-grained souffre du bottleneck plus serré. Moins de dimensions = moins de capacité à distinguer des paires très similaires
+- 71% i2t R@1 reste solide (comparable aux résultats publiés)
+
+**Verdict :** trade-off raisonnable. Un workspace 2x plus compact et 82% utilisé est une meilleure base pour ajouter le module fMRI qu'un workspace de 64 à 58% d'utilisation. La perte de 3 pts R@1 est le prix du bottleneck — conforme à la théorie GWT.
+
+### Bilan global (Run 13 → 16)
+
+Le GW vision+texte est prêt pour l'ajout du module cerveau (NSD). Workspace compact (32 dims, 82% utilisé), bon alignement inter-modal, architecture conforme aux papiers du lab.
