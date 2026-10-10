@@ -1,185 +1,74 @@
-# glow-cocoBrain
+# GLoW cocoBrain
 
-Global Workspace (GLoW) aligning vision (COCO images) and language (COCO captions) in a shared latent space. Built as a prototype for the "deep learning module for brain decoding and encoding" internship at ANITI C3PO (PI: Rufin VanRullen).
+Learning a shared representation for images, text and brain recordings.
 
-Next step: plug in a brain module (fMRI, NSD dataset) as a third modality.
+I started this project to learn how a model can connect images and text.
+The first experiments use photos and captions from COCO.
+I then added an fMRI module using NSD, where participants viewed some of those
+same images.
 
-## Project structure
+**An experimental project, still before V1.** Image and text experiments are in
+place. The brain extension is unfinished.
 
-```
-glow-cocoBrain/
-├── config/config.yaml         # All hyperparameters (dims, losses, training, data)
-├── main.py                    # Training entry point (Phase 1 + Phase 2 + eval)
-├── models/
-│   ├── encoders.py            # VisionEncoder (Linear on ResNet features), TextEncoder (Transformer)
-│   ├── decoders.py            # VisionDecoder (MLP), TextDecoder (Transformer)
-│   ├── domain_module.py       # DomainModule: encoder + decoder + projections
-│   ├── projections.py         # MLP projections: latent <-> workspace
-│   └── workspace.py           # GlobalWorkspace: fusion, translate, encode_domains
-├── losses/
-│   ├── contrastive.py         # InfoNCE loss in workspace space
-│   ├── translation.py         # Cross-modal reconstruction (MSE / cross-entropy)
-│   └── cycle.py               # Cycle consistency (A -> B -> A round-trip)
-├── pipeline/
-│   ├── train.py               # Training loop (pretrain + alignment)
-│   └── eval.py                # Evaluation (retrieval metrics, translation examples)
-├── data/
-│   ├── dataset.py             # COCODataset (pre-extracted features + tokenized captions)
-│   └── tokenizer.py           # SimpleTokenizer (word-level, 10k vocab)
-├── scripts/
-│   ├── download_coco.sh       # Download COCO 2017 (train + val + annotations)
-│   ├── extract_features.py    # Extract ResNet-50 features from images
-│   └── build_vocab.py         # Build vocabulary from captions
-├── notebooks/
-│   └── inference_viz.ipynb    # Visualization: translations, retrieval, losses, telephone arabe
-├── DEVLOG.md                  # Development log (what changed, why, results)
-└── CLAUDE.md                  # Project context and technical plan
+## The idea
+
+A photo and a caption can describe the same scene in very different ways. Each
+has its own encoder, which maps it into a shared space called the workspace.
+The model learns to bring matching examples together and recover one type of
+representation from another.
+
+```mermaid
+flowchart LR
+    I[Photo features] --> V[Vision module]
+    T[Caption features] --> L[Text module]
+    B[fMRI recordings] --> M[Brain module, experimental]
+    V <--> W[Shared workspace]
+    L <--> W
+    M <--> W
 ```
 
-## Setup
+This makes it possible to test image-to-caption and caption-to-image retrieval.
+The aim of the brain extension is to connect fMRI recordings to the same space.
+The current model works with feature vectors; the visual examples retrieve
+existing images and captions from a dataset.
 
-```bash
-# 1. Create virtual environment
-python3 -m venv venv
-source venv/bin/activate
+## What's in the repo
 
-# 2. Install dependencies
-pip install -r requirements.txt
-```
+- **Image and text training** using pre-extracted ResNet-50 and E5 features,
+  with separate autoencoders and projections into the workspace.
+- **Workspace experiments** with contrastive alignment, translation, round trips
+  and fusion, including training with only part of the data paired.
+- **An fMRI extension** with NSD preprocessing and a brain module trained while
+  the image and text modules stay frozen.
+- **Evaluation and an analysis notebook** for retrieval, reconstruction losses
+  and the geometry of the learned representations.
 
-## Data preparation
+The [experiment log](DEVLOG.md), written in French, records the changes, failed
+runs and results. It also contains older architectures that have since changed.
+The last brain experiments report retrieval near chance, and the following run
+has no recorded outcome. The fMRI preprocessing also needs a correction to the
+matching between recordings and images before new brain results can be evaluated.
+The [development guide](docs/development.md#known-nsd-blockers) explains the issue.
 
-Run these 3 scripts in order. Each one is idempotent (skips if data already exists).
+## Running experiments
 
-```bash
-# 1. Download COCO 2017 (~19 GB: train images, val images, annotations)
-bash scripts/download_coco.sh
+This is a Python and PyTorch research prototype. Training data, extracted
+features and model checkpoints are not included in the repository. Preparing
+them involves external downloads, substantial storage and local computation.
 
-# 2. Extract ResNet-50 features (takes ~20 min with GPU)
-#    Saves features_train.npy, features_val.npy, image_ids_*.json in data/coco/
-python scripts/extract_features.py
+The [development guide](docs/development.md) covers the current architecture,
+COCO preparation, training commands, the NSD extension and known limitations.
+Start with the image and text experiment; the fMRI path needs additional data,
+preprocessing fixes and validation.
 
-# 3. Build vocabulary from captions (top 10k words)
-#    Saves vocab.json in data/coco/
-python scripts/build_vocab.py
-```
+- [Image and text configuration](config/config.yaml)
+- [Brain experiment configuration](config/config_brain.yaml)
+- [Analysis notebook](notebooks/inference_viz.ipynb)
+- [Experiment log](DEVLOG.md)
+- [My portfolio](https://victormonnot.com)
 
-After this, `data/coco/` should contain:
-```
-data/coco/
-├── train2017/              # ~118k images
-├── val2017/                # ~5k images
-├── annotations/            # captions_train2017.json, captions_val2017.json
-├── features_train.npy      # (118287, 2048) ResNet-50 features
-├── features_val.npy        # (5000, 2048) ResNet-50 features
-├── image_ids_train.json    # image_id ordering matching features
-├── image_ids_val.json
-└── vocab.json              # SimpleTokenizer vocabulary
-```
+## References
 
-## Training
-
-Training runs in 2 phases automatically:
-
-```bash
-# Full training (Phase 1 + Phase 2)
-python main.py --name baseline
-
-# With a custom config
-python main.py --config path/to/config.yaml --name my_experiment
-
-# Phase 1 only (pretrain autoencoders)
-python main.py --phase pretrain --name pretrain_v1
-
-# Phase 2 only (workspace alignment, reusing Phase 1 from a previous run)
-python main.py --phase align --resume_pretrain checkpoints/run_001_pretrain_v1/checkpoint_pretrain.pt --name align_ws384
-
-# Iterate on Phase 2 with different hyperparams without redoing Phase 1
-python main.py --phase align --resume_pretrain checkpoints/run_001_pretrain_v1/checkpoint_pretrain.pt --name align_cycle2x
-```
-
-**Phase 1 — Pretrain autoencoders** (20 epochs): each domain learns to reconstruct its own input. Projections are frozen.
-
-**Phase 2 — Workspace alignment** (50 epochs): projections + workspace are trained with 3 losses (contrastive + translation + cycle consistency).
-
-Each run creates a versioned directory in `checkpoints/`:
-```
-checkpoints/
-├── run_001_pretrain_v1/
-│   ├── config.yaml              # Config snapshot (exactly what was used)
-│   ├── checkpoint_pretrain.pt   # After Phase 1
-│   ├── log_pretrain.json        # Loss per epoch (Phase 1)
-│   └── ...
-├── run_002_align_ws384/
-│   ├── config.yaml
-│   ├── checkpoint.pt            # Final model + config + eval results
-│   ├── log_align.json           # Losses per epoch (Phase 2)
-│   └── results.json             # Eval metrics (for easy comparison)
-├── run_003_baseline/            # --phase both: has everything
-│   ├── config.yaml
-│   ├── checkpoint_pretrain.pt
-│   ├── checkpoint.pt
-│   ├── log_pretrain.json
-│   ├── log_align.json
-│   └── results.json
-```
-
-**Tip:** training takes a few hours on a 4070. Use tmux to keep it running:
-```bash
-tmux new -s train
-python main.py --name my_experiment
-# Ctrl+B then D to detach
-# tmux attach -t train to come back
-```
-
-## Inference / Visualization
-
-```bash
-jupyter notebook notebooks/inference_viz.ipynb
-```
-
-The notebook includes:
-- Image -> Text translation (with real COCO images)
-- Retrieval examples: image -> top-5 captions, text -> top-5 images
-- Loss visualization per sample
-- "Telephone arabe": multiple passes through the workspace to see signal stability
-- t-SNE of workspace representations
-- Similarity distribution histograms
-
-## Configuration
-
-All hyperparameters are in `config/config.yaml`. Key settings:
-
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| workspace_dim | 384 | Shared workspace dimensionality (bottleneck) |
-| latent_dims | 512 | Per-domain latent space dimensionality |
-| vision.feature_dim | 2048 | ResNet-50 output dimension |
-| text.vocab_size | 10000 | Vocabulary size |
-| text.max_seq_len | 32 | Max caption length in tokens |
-| training.batch_size | 512 | Batch size |
-| losses.contrastive.temperature | 0.07 | InfoNCE temperature |
-
-## Architecture overview
-
-```
-Image (pixels)                    Caption (text)
-      |                                |
-  [ResNet-50 frozen]             [Tokenizer]
-      |                                |
-  features (2048)              token IDs (32)
-      |                                |
-  VisionEncoder                 TextEncoder
-  (Linear+LN+GELU)          (Embed+Transformer)
-      |                                |
-   z_vision (512)              z_text (512)
-      |                                |
-  projection MLP               projection MLP
-      \                              /
-       \                            /
-        -----> WORKSPACE (384) <-----
-              (attention fusion)
-```
-
-The workspace is the shared bottleneck. Cross-modal translation goes:
-`image features -> encode -> z_v -> project -> w -> inv_project -> z_t -> decode -> text logits`
+The experiments draw on [Semi-supervised Multimodal Representation Learning
+through a Global Workspace](https://arxiv.org/abs/2306.15711) and
+[Multimodal Dreaming](https://arxiv.org/abs/2502.21142).
